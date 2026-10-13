@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.docx-render/
+tmp*/
+
+# Runtime and user data. The immutable base dictionaries and their provenance
+# are distributed with the application; every writable/user-specific item
+# beneath dictionaries remains ignored.
+dictionaries/*
+!dictionaries/base/
+dictionaries/base/*
+!dictionaries/base/american_words.txt
+!dictionaries/base/british_words.txt
+!dictionaries/base/README.md
+!dictionaries/base/SCOWL-COPYRIGHT.txt
+/Test Files/
+backup_subtitles.zip
+*.srt
+*.SRT
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
