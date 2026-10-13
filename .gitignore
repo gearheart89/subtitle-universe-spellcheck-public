@@ -5,6 +5,11 @@ __pycache__/
 htmlcov/
 .docx-render/
 tmp*/
+.venv-build/
+build/
+dist/
+artifacts/
+*.spec
 
 # Runtime and user data. The immutable base dictionaries and their provenance
 # are distributed with the application; every writable/user-specific item

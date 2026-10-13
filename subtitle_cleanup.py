@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.0.0-rc2"
+SCRIPT_VERSION = "1.0.0-rc3"
 SCHEMA_VERSION = 1
 
 BASE_LANGUAGE_CHOICES = {"1": "american", "2": "british"}
@@ -249,6 +249,19 @@ BOOL_FALSE = {"no", "n", "false", "f", "0", "off"}
 
 def now_iso() -> str:
     return datetime.now().replace(microsecond=0).isoformat()
+
+
+def application_root() -> Path:
+    """Return the portable folder that owns runtime data and scan defaults."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def application_entry_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve()
+    return Path(__file__).resolve()
 
 
 def clear_screen() -> None:
@@ -577,7 +590,7 @@ class DictionaryContext:
 
 class SubtitleCleanupTool:
     def __init__(self) -> None:
-        self.script_dir = Path(__file__).resolve().parent
+        self.script_dir = application_root()
         self.dict_dir = self.script_dir / "dictionaries"
         self.base_dir = self.dict_dir / "base"
         self.user_dir = self.dict_dir / "user"
@@ -703,7 +716,7 @@ class SubtitleCleanupTool:
         while True:
             clear_screen()
             print(f"Subtitle Cleanup Tool v{SCRIPT_VERSION}")
-            print(f"Running file: {Path(__file__).resolve()}")
+            print(f"Running file: {application_entry_path()}")
             print(f"Automatic scan root: {self.script_dir}")
             print()
             print("Subtitle Scan:")

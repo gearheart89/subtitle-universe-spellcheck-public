@@ -24,6 +24,12 @@ recovery, repeatable undo, and atomic subtitle writes.
 python subtitle_cleanup.py
 ```
 
+Windows users may instead download the unsigned portable ZIP from the GitHub
+Release. Extract the complete `SubtitleUniverseSpellcheck` folder and run
+`SubtitleUniverseSpellcheck.exe`. Windows may display an **Unknown publisher**
+warning because the executable is not code signed. Verify the ZIP against its
+published SHA-256 file before extracting it.
+
 On first run, the program creates ignored writable data beneath
 `dictionaries/user` and `dictionaries/universes`, plus local option, session,
 and event-log files. These files are not part of the repository.
@@ -63,13 +69,20 @@ scopes, backup behavior, spellcheck actions, and recovery guidance.
 No subtitle files, user dictionaries, Universe dictionaries, session state,
 event logs, or backup archives are distributed by this repository.
 
+When upgrading a portable Windows copy, preserve
+`dictionaries/user`, `dictionaries/universes`, and
+`dictionaries/options.ini`. Copy them into the same locations in the newly
+extracted folder while the program is closed. The packaged
+`dictionaries/base` folder belongs to the release and should be replaced by
+the new version.
+
 ## Test
 
 ```console
 python -m unittest discover -s tests -v
 ```
 
-The release candidate has 207 deterministic regression tests. It has also been
+The release candidate has 209 deterministic regression tests. It has also been
 validated against synthetic end-to-end fixtures and a read-only 213-file,
 149,058-cue corpus audit; that copyrighted corpus is not included.
 
@@ -77,6 +90,22 @@ validated against synthetic end-to-end fixtures and a read-only 213-file,
 
 - [User guide](docs/USER_GUIDE.md)
 - [Product specification](SPEC.md)
+
+## Rebuilding the Windows package
+
+The Windows executable is a PyInstaller one-folder build. PyInstaller is a
+build dependency only; the resulting application does not require Python.
+
+```powershell
+python -m venv .venv-build
+.\.venv-build\Scripts\python.exe -m pip install -r requirements-build.txt
+.\build_windows.ps1 -PythonExecutable .\.venv-build\Scripts\python.exe
+```
+
+The script creates an unsigned ZIP and matching SHA-256 file beneath
+`artifacts`. It copies only the immutable base dictionaries, public
+documentation, and applicable runtime redistribution notices—never local User
+or Universe dictionaries, subtitle files, session state, logs, or backups.
 
 ## Licensing and dictionary attribution
 

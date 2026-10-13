@@ -452,7 +452,31 @@ Version 1 is complete when all of the following are implemented and tested:
 - Recent addition review screens.
 - Session log flushing.
 
-## 14. Deferred ideas
+## 14. Portable Windows distribution
+
+The supported Windows binary is an unsigned PyInstaller one-folder build. The
+folder uses the executable's parent as its application root so writable User
+and Universe dictionaries, options, recovery state, logs, backups, and the
+default scan root remain portable beside the executable rather than inside a
+temporary bundle directory.
+
+The release ZIP contains the executable and its runtime components, the full
+American and British SCOWL base dictionaries, SCOWL provenance and required
+notice, the MIT license, README, and user guide. It must not contain subtitle
+files, User or Universe dictionaries, options, recovery state, logs, or backup
+archives. Applicable Python and build-tool redistribution notices are included
+with the runtime. The ZIP is accompanied by a SHA-256 checksum file and release
+notes that disclose the executable is unsigned and may display an Unknown
+publisher warning.
+
+PyInstaller is pinned as a build-only dependency and does not change the
+single-file, standard-library-only application runtime. A Windows executable
+must be built and smoke-tested on Windows. Upgrades preserve personal data by
+copying `dictionaries/user`, `dictionaries/universes`, and optionally
+`dictionaries/options.ini` into a newly extracted release while the program is
+closed. The base dictionary folder is replaced by each release.
+
+## 15. Deferred ideas
 
 - Richer undo throughout all maintenance screens.
 - Improved acronym and HTML/italic handling.

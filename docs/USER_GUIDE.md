@@ -6,6 +6,12 @@ Run `python subtitle_cleanup.py` from a terminal. The tool uses only Python's
 standard library. It keeps writable settings and dictionaries beside the
 script, so install it in a folder where your account can create files.
 
+For the portable Windows release, extract the complete folder before running
+`SubtitleUniverseSpellcheck.exe`. Do not run the executable from inside the
+ZIP. Windows may show an **Unknown publisher** warning because the executable
+is intentionally unsigned. Compare the downloaded ZIP with the accompanying
+SHA-256 file before extracting it.
+
 Open **Options menu → File Discovery and Safety** and enable ZIP backups before
 editing irreplaceable subtitles. Backups contain only `.srt` files and are
 created before formatting or spellcheck changes begin.
@@ -108,4 +114,19 @@ Runtime files beneath `dictionaries/`, selected subtitle files, and generated
 `backup_subtitles.zip` archives are intentionally excluded from Git. Do not
 publish them with bug reports. A useful report includes the program version,
 the relevant options, a small synthetic reproduction, and the displayed error.
+
+## Updating a portable Windows installation
+
+Close the program and extract the new release to a separate folder. To retain
+personal data, copy these items from the old folder to the matching locations
+in the new folder:
+
+- `dictionaries/user`
+- `dictionaries/universes`
+- `dictionaries/options.ini`
+
+Copy `dictionaries/session_state.json` only when deliberately resuming an
+interrupted scan against files that remain in the same locations. The session
+log is optional. Do not copy the old `dictionaries/base` folder; each release
+includes the correct SCOWL base dictionaries and attribution.
 
