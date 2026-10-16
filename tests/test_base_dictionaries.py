@@ -2,7 +2,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from subtitle_cleanup import SubtitleCleanupTool, application_root
+from app import subtitle_cleanup
+from app.subtitle_cleanup import SubtitleCleanupTool, application_root
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -67,18 +68,19 @@ class BaseDictionaryTests(unittest.TestCase):
         self.assertIn("organise", british)
         self.assertIn("organize", british)
 
-    def test_application_root_is_the_source_folder_for_python_execution(self):
-        expected = Path(__import__("subtitle_cleanup").__file__).resolve().parent
+    def test_application_root_is_parent_of_source_app_folder(self):
+        module_path = Path(subtitle_cleanup.__file__).resolve()
+        expected = module_path.parent.parent
 
-        with patch("subtitle_cleanup.sys.frozen", False, create=True):
+        with patch("app.subtitle_cleanup.sys.frozen", False, create=True):
             self.assertEqual(application_root(), expected)
 
     def test_application_root_is_beside_the_frozen_executable(self):
         executable = Path("C:/Portable/SubtitleUniverseSpellcheck.exe")
 
         with (
-            patch("subtitle_cleanup.sys.frozen", True, create=True),
-            patch("subtitle_cleanup.sys.executable", str(executable)),
+            patch("app.subtitle_cleanup.sys.frozen", True, create=True),
+            patch("app.subtitle_cleanup.sys.executable", str(executable)),
         ):
             self.assertEqual(application_root(), executable.resolve().parent)
 

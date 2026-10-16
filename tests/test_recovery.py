@@ -1,10 +1,11 @@
 import io
 import json
+import os
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from subtitle_cleanup import DEFAULT_OPTIONS, DictionaryContext, SubtitleCleanupTool
+from app.subtitle_cleanup import DEFAULT_OPTIONS, DictionaryContext, SubtitleCleanupTool
 
 
 def make_tool() -> SubtitleCleanupTool:
@@ -306,6 +307,31 @@ class RecoveryFlowTests(unittest.TestCase):
 
 
 class StateFileTests(unittest.TestCase):
+    def test_dictionary_and_option_saves_use_atomic_text_replacement(self):
+        tool = make_tool()
+        word_path = Path("C:/Example/dictionaries/user/american_words.txt")
+        substitution_path = Path(
+            "C:/Example/dictionaries/user/american_substitutions.tsv"
+        )
+        with (
+            patch.object(Path, "mkdir"),
+            patch.object(tool, "atomic_write_text") as atomic_write_text,
+        ):
+            tool.save_word_list(word_path, ["Beta", "Alpha"])
+            tool.save_substitutions(substitution_path, {"teh": "the"})
+            tool.save_options()
+
+        self.assertEqual(
+            atomic_write_text.call_args_list[0].args,
+            (word_path, "Alpha\nBeta\n"),
+        )
+        self.assertEqual(
+            atomic_write_text.call_args_list[1].args,
+            (substitution_path, "teh\tthe\n"),
+        )
+        self.assertEqual(atomic_write_text.call_args_list[2].args[0], tool.options_path)
+        self.assertIn("[options]", atomic_write_text.call_args_list[2].args[1])
+
     def test_missing_and_malformed_state_are_treated_as_no_session(self):
         tool = make_tool()
         with patch.object(Path, "exists", return_value=False):
@@ -326,38 +352,44 @@ class StateFileTests(unittest.TestCase):
         state = {"session_active": True}
         with (
             patch.object(Path, "mkdir") as mkdir,
-            patch.object(Path, "write_text") as write_text,
-            patch.object(Path, "exists", return_value=False),
-            patch("subtitle_cleanup.os.replace") as replace,
+            patch.object(tool, "atomic_write_text") as atomic_write_text,
         ):
             tool.save_session_state(state)
 
         mkdir.assert_called_once_with(parents=True, exist_ok=True)
-        payload = json.loads(write_text.call_args.args[0])
+        payload = json.loads(atomic_write_text.call_args.args[1])
         self.assertTrue(payload["session_active"])
         self.assertEqual(payload["schema_version"], 1)
-        replace.assert_called_once_with(
-            Path("C:/Example/dictionaries/session_state.json.tmp"),
-            tool.session_state_path,
+        self.assertEqual(
+            atomic_write_text.call_args.args[0], tool.session_state_path
         )
 
-    def test_state_save_retries_a_transient_windows_replace_lock(self):
+    def test_atomic_writer_retries_a_transient_windows_replace_lock(self):
         tool = make_tool()
-        state = {"session_active": True}
-        with (
-            patch.object(Path, "mkdir"),
-            patch.object(Path, "write_text"),
-            patch.object(Path, "exists", return_value=False),
-            patch(
-                "subtitle_cleanup.os.replace",
-                side_effect=[PermissionError("temporarily locked"), None],
-            ) as replace,
-            patch("subtitle_cleanup.time.sleep") as sleep,
-        ):
-            tool.save_session_state(state)
+        path = Path(__file__).with_name("_atomic_retry_state.json")
+        try:
+            path.unlink(missing_ok=True)
+            real_replace = os.replace
+            attempts = 0
 
-        self.assertEqual(replace.call_count, 2)
-        sleep.assert_called_once_with(0.05)
+            def transient_lock(source, destination):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise PermissionError("temporarily locked")
+                real_replace(source, destination)
+
+            with (
+                patch("subtitle_cleanup.os.replace", side_effect=transient_lock),
+                patch("subtitle_cleanup.time.sleep") as sleep,
+            ):
+                tool.atomic_write_text(path, '{"ok": true}')
+
+            self.assertEqual(attempts, 2)
+            sleep.assert_called_once_with(0.05)
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"ok": true}')
+        finally:
+            path.unlink(missing_ok=True)
 
 
 class RecoveryPromptTests(unittest.TestCase):
@@ -422,6 +454,7 @@ class RecoveryPromptTests(unittest.TestCase):
 class RecoveryNewTargetFlowTests(unittest.TestCase):
     def test_new_scan_recovery_choice_uses_normal_scan_and_countdown_workflow(self):
         tool = make_tool()
+        tool.options["capitalization_mode"] = "subtitle"
         target = Path("C:/Shows/New Target")
         subtitle = target / "episode.srt"
         tool.load_session_state = Mock(

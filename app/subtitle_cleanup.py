@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import configparser
 import difflib
+import gzip
+import hashlib
+import io
 import json
 import os
 import re
@@ -18,16 +21,48 @@ import sys
 import tempfile
 import textwrap
 import time
+import platform
 import urllib.parse
+import urllib.error
+import urllib.request
 import webbrowser
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.0.0-rc3"
+SCRIPT_VERSION = "1.1.0"
 SCHEMA_VERSION = 1
+PROJECT_URL = "https://github.com/gearheart89/subtitle-universe-spellcheck-public"
+UPDATE_API_URL = "https://api.github.com/repos/gearheart89/subtitle-universe-spellcheck-public/releases/latest"
+UPDATE_TIMEOUT_SECONDS = 4.0
+UPDATE_METADATA_LIMIT = 2 * 1024 * 1024
+UPDATE_CHECKSUM_LIMIT = 64 * 1024
+UPDATE_ARCHIVE_LIMIT = 512 * 1024 * 1024
+UPDATE_ALLOWED_HOSTS = {
+    "api.github.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
+SCOWL_URL = "https://github.com/en-wl/wordlist/tree/rel-2026.02.25"
+SCOWL_CREDIT = (
+    "American and British base dictionaries are generated from SCOWL 2026.02.25.\n"
+    "Copyright 2000-2026 by Kevin Atkinson\n\n"
+    "Permission to use, copy, modify, distribute, and sell any part of SCOWLv2, "
+    "or word lists created from it, is hereby granted without fee, provided that "
+    "the above copyright notice appears in all copies and that both the above "
+    "copyright notice and this notice appear in supporting documentation. Kevin "
+    "Atkinson makes no representations about the suitability of this database for "
+    "any purpose. It is provided ‘as is’ without express or implied warranty."
+)
+SESSION_LOG_HELP = (
+    "This clears dictionaries/session_log.jsonl and removes its history from "
+    "the Recent additions screens. It does not remove dictionary entries.\n"
+    "It also does not clear or abandon an interrupted spellcheck session, "
+    "including CLI and GUI recovery."
+)
 
 BASE_LANGUAGE_CHOICES = {"1": "american", "2": "british"}
 LOWERCASE_WORDS = {
@@ -39,7 +74,6 @@ LOWERCASE_WORDS = {
 COMMON_ACRONYMS = {
     "AI", "ASAP", "CIA", "DC", "DNA", "DVD", "FBI", "GPS", "HD", "ID", "NASA",
     "OK", "PC", "TV", "UFO", "UK", "UN", "US", "USA", "USB", "VIP", "WiFi",
-    "MALP", "SGC", "DHD",
 }
 UNITED_STATES_CONTEXT_PATTERNS = [
     "US military", "US government", "US Air Force", "US Army", "US Navy", "US Marines",
@@ -89,12 +123,15 @@ def preferred_acronym_casing(token: str, acronym_set: set) -> Optional[str]:
     return None
 
 DEFAULT_OPTIONS: Dict[str, object] = {
+    "check_for_updates_at_startup": False,
+    "capitalization_mode": "ask_always",
     "scan_folders_recursively": True,
     "recognize_dropped_g_apostrophe_forms": True,
     "remove_periods_from_abbreviations": True,
     "convert_double_hyphen_and_three_dots_to_ellipsis": False,
     "title_case_bracketed_sound_effects": True,
     "fix_mostly_uppercase_lines": True,
+    "capitalize_lowercase_pronoun_i": True,
     "adjust_subtitle_line_count": True,
     "preferred_max_visible_dialogue_lines": 2,
     "count_sound_effect_lines_toward_max": False,
@@ -115,12 +152,15 @@ DEFAULT_OPTIONS: Dict[str, object] = {
 }
 
 OPTION_LABELS = {
+    "check_for_updates_at_startup": "Check for updates at startup",
+    "capitalization_mode": "Capitalization preference",
     "scan_folders_recursively": "Scan folders recursively",
     "recognize_dropped_g_apostrophe_forms": "Recognize informal -in' forms when the -ing word is known",
     "remove_periods_from_abbreviations": "Remove periods from abbreviations",
     "convert_double_hyphen_and_three_dots_to_ellipsis": "Convert -- and ... to the ellipsis character",
     "title_case_bracketed_sound_effects": "Title-case bracketed sound effects",
     "fix_mostly_uppercase_lines": "Fix capitalization when a line is mostly uppercase",
+    "capitalize_lowercase_pronoun_i": "Capitalize lowercase pronoun i and its contractions",
     "adjust_subtitle_line_count": "Adjust subtitle line count/length",
     "preferred_max_visible_dialogue_lines": "Preferred max visible dialogue lines per subtitle",
     "count_sound_effect_lines_toward_max": "Count sound-effect lines toward max visible line count",
@@ -141,12 +181,15 @@ OPTION_LABELS = {
 }
 
 OPTION_DESCRIPTIONS = {
+    "check_for_updates_at_startup": "When enabled, launch performs a short, nonfatal check of the public GitHub release page. A newer version is never downloaded without permission, and Stage 1 never installs or replaces application files.",
+    "capitalization_mode": "Ask always prompts at the start of each new scan but not when resuming one already in progress. Source capitalization preserves the capitalization in the subtitle. Subtitle-aware capitalization applies the tool's conservative pronoun, sound-effect, name, acronym, and mostly-uppercase repairs. All caps changes all visible subtitle text to uppercase while preserving markup tags.",
     "scan_folders_recursively": "When enabled, the selected folder and every child folder are scanned for .srt files. When disabled, only .srt files directly inside the selected folder are scanned.",
     "recognize_dropped_g_apostrophe_forms": "When enabled, informal dialogue forms ending in -in' or -in’ are accepted when adding g produces a known -ing word. For example, goin' is recognized only when going is in the active dictionaries.",
     "remove_periods_from_abbreviations": "Normalizes dotted acronyms such as M.A.L.P. -> MALP and S.G.C. -> SGC. Dotted U.S. and U.S.A. are treated as protected acronym forms before conservative us/US handling.",
     "convert_double_hyphen_and_three_dots_to_ellipsis": "When enabled, converts -- and runs of three or more periods to the single ellipsis character … before substitutions, capitalization repair, speaker-break detection, or line reflow.",
     "title_case_bracketed_sound_effects": "Changes bracketed sound effects such as [FOOTSTEPS APPROACHING] to [Footsteps Approaching]. Small connector words stay lowercase unless first or last.",
     "fix_mostly_uppercase_lines": "Repairs lines where more than 80% of letters are uppercase. Uses substitutions, names, known acronyms, dictionaries, connector words, and conservative fallback casing.",
+    "capitalize_lowercase_pronoun_i": "Capitalizes standalone lowercase i and the common contractions i'm, i'd, i'll, and i've in ordinary dialogue. Subtitle tags, i.e., and web addresses are protected.",
     "adjust_subtitle_line_count": "Reflows normal dialogue toward the preferred line length and visible dialogue line count while preserving hard-break speaker/sound-effect lines.",
     "preferred_max_visible_dialogue_lines": "Target number of visible dialogue lines per subtitle cue. Hard-break speaker lines may exceed this target to preserve clarity.",
     "count_sound_effect_lines_toward_max": "When false, [Sound Effect] lines are excluded from the visible dialogue line count target.",
@@ -174,11 +217,13 @@ OPTION_GROUPS = [
     (
         "Spelling and Text Cleanup",
         [
+            "capitalization_mode",
             "recognize_dropped_g_apostrophe_forms",
             "remove_periods_from_abbreviations",
             "convert_double_hyphen_and_three_dots_to_ellipsis",
             "title_case_bracketed_sound_effects",
             "fix_mostly_uppercase_lines",
+            "capitalize_lowercase_pronoun_i",
         ],
     ),
     (
@@ -206,8 +251,26 @@ OPTION_GROUPS = [
             "report_suspicious_text",
         ],
     ),
-    ("Menus and Display", ["maximum_universe_display_name_length"]),
+    (
+        "Menus and Display",
+        ["check_for_updates_at_startup", "maximum_universe_display_name_length"],
+    ),
 ]
+
+CAPITALIZATION_MODES = {
+    "ask_always": "Ask always",
+    "source": "Source capitalization",
+    "subtitle": "Subtitle-aware capitalization",
+    "all_caps": "All caps",
+}
+CAPITALIZATION_SCAN_MODES = {
+    key: label for key, label in CAPITALIZATION_MODES.items() if key != "ask_always"
+}
+CAPITALIZATION_DEPENDENT_OPTIONS = {
+    "title_case_bracketed_sound_effects",
+    "fix_mostly_uppercase_lines",
+    "capitalize_lowercase_pronoun_i",
+}
 
 OPTION_INLINE_EXAMPLES = {
     "repair_corrupted_music_symbols": "[â™ª → ♪] [â™« → ♫]",
@@ -217,6 +280,7 @@ OPTION_INLINE_EXAMPLES = {
     "fix_spaces_around_punctuation": "[Hello ,world. → Hello, world.]",
     "repair_unambiguous_italic_tag_errors": "[<i>Hello<i> → <i>Hello</i>]",
     "report_suspicious_text": "[reports only—does not edit]",
+    "capitalize_lowercase_pronoun_i": "[i told you → I told you] [i'm → I'm]",
 }
 
 MUSIC_SYMBOL_REPLACEMENTS = {
@@ -255,7 +319,10 @@ def application_root() -> Path:
     """Return the portable folder that owns runtime data and scan defaults."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    source_directory = Path(__file__).resolve().parent
+    if source_directory.name.casefold() == "app":
+        return source_directory.parent
+    return source_directory
 
 
 def application_entry_path() -> Path:
@@ -453,6 +520,16 @@ def strip_html_tags(text: str) -> str:
     return HTML_TAG_RE.sub("", text)
 
 
+def dictionary_key(text: str) -> str:
+    """Return a case-insensitive key with typographic apostrophes unified."""
+    return text.replace("’", "'").casefold()
+
+
+def dictionary_set_contains(values: set, key: str) -> bool:
+    """Support normalized loaded sets and in-memory contexts built by callers."""
+    return key in values or key.replace("'", "’") in values
+
+
 @dataclass
 class SubtitleBlock:
     index: str
@@ -476,6 +553,47 @@ class SubtitleBlock:
 
 
 @dataclass(frozen=True)
+class SpellcheckIssuePreview:
+    """Interface-neutral, read-only description of one spelling issue."""
+
+    path: Path
+    relative_file: str
+    file_number: int
+    total_files: int
+    subtitle_index: int
+    total_subtitles: int
+    word: str
+    line_index: int
+    start: int
+    end: int
+    suggestions: Tuple[str, ...]
+    previous_blocks: Tuple[str, ...]
+    current_block: str
+    current_text: str
+    timestamp: str
+    next_blocks: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SpellcheckReviewUndoAction:
+    """One reversible mutation of a GUI review's in-memory state."""
+
+    kind: str
+    issue: SpellcheckIssuePreview
+    before_text_lines: Tuple[str, ...] = ()
+    dictionary_effect: Optional[dict] = None
+    replacement_effect: Optional[dict] = None
+
+
+@dataclass(frozen=True)
+class SpellcheckReviewCommitResult:
+    """Files written and backup archives retained by one GUI review commit."""
+
+    changed_files: Tuple[Path, ...] = ()
+    backup_archives: Tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True)
 class SubtitleFileFormat:
     encoding: str = "utf-8"
     bom: bytes = b""
@@ -495,6 +613,8 @@ class DictionaryContext:
     universe_words: set = field(default_factory=set)
     user_names: Dict[str, str] = field(default_factory=dict)
     universe_names: Dict[str, str] = field(default_factory=dict)
+    user_acronyms: set = field(default_factory=set)
+    universe_acronyms: set = field(default_factory=set)
     substitutions: Dict[str, str] = field(default_factory=dict)
     user_substitutions: Dict[str, str] = field(default_factory=dict)
     universe_substitutions: Dict[str, str] = field(default_factory=dict)
@@ -528,16 +648,20 @@ class DictionaryContext:
     @property
     def phrase_map(self) -> Dict[str, str]:
         phrases = {
-            phrase.casefold(): phrase
+            dictionary_key(phrase): phrase
             for phrase in self.user_words | self.universe_words
             if re.search(r"\s", phrase)
         }
         phrases.update({
-            key: preferred
-            for key, preferred in self.name_map.items()
+            dictionary_key(preferred): preferred
+            for preferred in self.name_map.values()
             if re.search(r"\s", preferred)
         })
         return phrases
+
+    @property
+    def explicit_acronyms(self) -> set:
+        return self.user_acronyms | self.universe_acronyms
 
     def is_known_word(self, word: str, session_ignores: Optional[set] = None) -> bool:
         if not word:
@@ -546,14 +670,14 @@ class DictionaryContext:
         clean = word.strip("'’")
         if not clean:
             return True
-        lower = clean.casefold()
-        if session_ignores and lower in session_ignores:
+        lower = dictionary_key(clean)
+        if session_ignores and dictionary_set_contains(session_ignores, lower):
             return True
         if (
             lower in LOWERCASE_WORDS
-            or lower in self.base_words
-            or lower in self.user_words
-            or lower in self.universe_words
+            or dictionary_set_contains(self.base_words, lower)
+            or dictionary_set_contains(self.user_words, lower)
+            or dictionary_set_contains(self.universe_words, lower)
         ):
             return True
         if (
@@ -562,18 +686,23 @@ class DictionaryContext:
             and len(lower) > 2
             and lower.endswith("in")
             and (
-                f"{lower}g" in self.base_words
-                or f"{lower}g" in self.user_words
-                or f"{lower}g" in self.universe_words
+                dictionary_set_contains(self.base_words, f"{lower}g")
+                or dictionary_set_contains(self.user_words, f"{lower}g")
+                or dictionary_set_contains(self.universe_words, f"{lower}g")
             )
         ):
             return True
-        if lower in self.single_name_map:
+        single_names = self.single_name_map
+        if lower in single_names or lower.replace("'", "’") in single_names:
             return True
         if preferred_acronym_casing(clean, self.acronym_set) is not None:
             return True
         # Possessive names: O'Neill's style words are tokenized as O'Neill, but handle simple s.
-        if lower.endswith("s") and lower[:-1] in self.name_map:
+        names = self.name_map
+        name_base = lower[:-1]
+        if lower.endswith("s") and (
+            name_base in names or name_base.replace("'", "’") in names
+        ):
             return True
         return False
 
@@ -588,6 +717,111 @@ class DictionaryContext:
         return difflib.get_close_matches(word, ordered_candidates, n=6, cutoff=0.68)
 
 
+@dataclass
+class SpellcheckReviewSession:
+    """In-memory spelling review state shared by non-console interfaces."""
+
+    files: Tuple[Path, ...]
+    target: Path
+    context: DictionaryContext
+    options_snapshot: Dict[str, object] = field(default_factory=dict)
+    mode: str = "spellcheck"
+    prepared_blocks: Dict[int, List[SubtitleBlock]] = field(default_factory=dict)
+    source_bytes: Dict[int, bytes] = field(default_factory=dict)
+    ignored_occurrences: set = field(default_factory=set)
+    ignored_words: set = field(default_factory=set)
+    substitutions: Dict[str, str] = field(default_factory=dict)
+    validation_findings: List[dict] = field(default_factory=list)
+    undo_actions: List[SpellcheckReviewUndoAction] = field(default_factory=list)
+    file_index: int = 0
+    subtitle_index: int = 0
+    current_issue: Optional[SpellcheckIssuePreview] = None
+    recovery_paused: bool = False
+
+
+class SpellcheckReviewPaused(Exception):
+    """Signal a requested pause without treating it as a scan failure."""
+
+
+class UpdateError(RuntimeError):
+    """Raised when release metadata or a downloaded update is not trustworthy."""
+
+
+@dataclass(frozen=True)
+class ReleaseAsset:
+    name: str
+    url: str
+    size: int
+    digest: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ReleaseUpdate:
+    version: str
+    tag: str
+    name: str
+    page_url: str
+    notes: str
+    asset: ReleaseAsset
+    checksum_asset: ReleaseAsset
+
+
+def _version_parts(value: str) -> Tuple[Tuple[int, ...], Tuple[Tuple[int, object], ...]]:
+    """Return comparable numeric and prerelease components for project versions."""
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)*)(?:[-+](.+))?", value.strip(), re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Unsupported version: {value}")
+    numeric = tuple(int(part) for part in match.group(1).split("."))
+    suffix = match.group(2)
+    if suffix is None:
+        return numeric, ((2, ""),)
+    tokens: List[Tuple[int, object]] = []
+    for token in re.findall(r"[A-Za-z]+|\d+", suffix.casefold()):
+        tokens.append((1, int(token)) if token.isdigit() else (0, token))
+    return numeric, tuple(tokens)
+
+
+def is_newer_version(candidate: str, current: str) -> bool:
+    """Compare the stable GitHub release version with this runtime version."""
+    candidate_numeric, candidate_suffix = _version_parts(candidate)
+    current_numeric, current_suffix = _version_parts(current)
+    width = max(len(candidate_numeric), len(current_numeric))
+    candidate_numeric += (0,) * (width - len(candidate_numeric))
+    current_numeric += (0,) * (width - len(current_numeric))
+    if candidate_numeric != current_numeric:
+        return candidate_numeric > current_numeric
+    return candidate_suffix > current_suffix
+
+
+def _validated_update_url(url: str, *, project_asset: bool = False) -> str:
+    parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").casefold()
+    if parsed.scheme.casefold() != "https" or hostname not in UPDATE_ALLOWED_HOSTS:
+        raise UpdateError("The update service returned an untrusted download address.")
+    if project_asset and (
+        hostname != "github.com"
+        or not parsed.path.casefold().startswith(
+            "/gearheart89/subtitle-universe-spellcheck-public/releases/download/"
+        )
+    ):
+        raise UpdateError("The update asset does not belong to the configured project.")
+    return url
+
+
+def _read_limited_response(response, limit: int, description: str) -> bytes:
+    raw_length = response.headers.get("Content-Length") if getattr(response, "headers", None) else None
+    if raw_length:
+        try:
+            if int(raw_length) > limit:
+                raise UpdateError(f"The {description} exceeds the allowed size.")
+        except ValueError as error:
+            raise UpdateError(f"The {description} has an invalid size.") from error
+    data = response.read(limit + 1)
+    if len(data) > limit:
+        raise UpdateError(f"The {description} exceeds the allowed size.")
+    return data
+
+
 class SubtitleCleanupTool:
     def __init__(self) -> None:
         self.script_dir = application_root()
@@ -597,8 +831,10 @@ class SubtitleCleanupTool:
         self.universe_dir = self.dict_dir / "universes"
         self.options_path = self.dict_dir / "options.ini"
         self.session_state_path = self.dict_dir / "session_state.json"
+        self.gui_session_state_path = self.dict_dir / "gui_session_state.json.gz"
         self.session_log_path = self.dict_dir / "session_log.jsonl"
         self.options: Dict[str, object] = dict(DEFAULT_OPTIONS)
+        self.update_check_preference_confirmed = False
         self.undo_stack: List[dict] = []
         self.current_session_ignores: set = set()
         self.current_session_substitutions: Dict[str, str] = {}
@@ -620,7 +856,7 @@ class SubtitleCleanupTool:
             base_words_path = self.base_dir / f"{language}_words.txt"
             if not base_words_path.exists():
                 base_words_path.write_text("\n".join(sorted_unique(COMMON_BASE_WORDS.split())) + "\n", encoding="utf-8")
-            for suffix in ("words", "names"):
+            for suffix in ("words", "names", "acronyms"):
                 path = self.user_dir / f"{language}_{suffix}.txt"
                 if not path.exists():
                     path.write_text("", encoding="utf-8")
@@ -634,6 +870,9 @@ class SubtitleCleanupTool:
     def load_options(self) -> None:
         parser = configparser.ConfigParser()
         parser.read(self.options_path, encoding="utf-8")
+        self.update_check_preference_confirmed = parser.getboolean(
+            "options", "update_check_preference_confirmed", fallback=False
+        )
         loaded = dict(DEFAULT_OPTIONS)
         if parser.has_section("options"):
             for key, default in DEFAULT_OPTIONS.items():
@@ -648,15 +887,300 @@ class SubtitleCleanupTool:
                     except ValueError:
                         loaded[key] = default
                 else:
-                    loaded[key] = raw
+                    loaded[key] = (
+                        raw
+                        if key != "capitalization_mode" or raw in CAPITALIZATION_MODES
+                        else str(default)
+                    )
         self.options = loaded
 
     def save_options(self) -> None:
         parser = configparser.ConfigParser()
         parser["options"] = {key: str(value) for key, value in self.options.items()}
+        parser["options"]["update_check_preference_confirmed"] = str(
+            getattr(self, "update_check_preference_confirmed", False)
+        )
         self.dict_dir.mkdir(parents=True, exist_ok=True)
-        with self.options_path.open("w", encoding="utf-8") as handle:
-            parser.write(handle)
+        output = io.StringIO()
+        parser.write(output)
+        self.atomic_write_text(self.options_path, output.getvalue())
+
+    def set_option_value(
+        self,
+        key: str,
+        value: object,
+        *,
+        allow_long_universe_names: bool = False,
+    ) -> None:
+        """Validate and atomically persist one option without console prompts."""
+        if key not in DEFAULT_OPTIONS:
+            raise ValueError("That option is not recognized.")
+        default = DEFAULT_OPTIONS[key]
+        if isinstance(default, bool):
+            if not isinstance(value, bool):
+                raise ValueError("This option must be true or false.")
+        elif isinstance(default, int):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError("This option must be a positive whole number.")
+            if (
+                key == "maximum_universe_display_name_length"
+                and value > 32
+                and not allow_long_universe_names
+            ):
+                raise ValueError(
+                    "Universe names longer than 32 characters may break table layouts."
+                )
+        elif key == "capitalization_mode" and value not in CAPITALIZATION_MODES:
+            raise ValueError("Choose a listed capitalization preference.")
+        previous = self.options[key]
+        previous_update_confirmation = getattr(
+            self, "update_check_preference_confirmed", False
+        )
+        self.options[key] = value
+        if key == "check_for_updates_at_startup":
+            self.update_check_preference_confirmed = True
+        try:
+            self.save_options()
+        except Exception:
+            self.options[key] = previous
+            self.update_check_preference_confirmed = previous_update_confirmation
+            raise
+
+    # ------------------------------------------------------------------
+    # Stage 1 update discovery and verified ZIP download
+    # ------------------------------------------------------------------
+    def check_for_update(
+        self,
+        *,
+        current_version: str = SCRIPT_VERSION,
+        frozen: Optional[bool] = None,
+        platform_name: Optional[str] = None,
+        machine: Optional[str] = None,
+        opener=urllib.request.urlopen,
+        timeout: float = UPDATE_TIMEOUT_SECONDS,
+    ) -> Optional[ReleaseUpdate]:
+        """Return the matching newer release without downloading or installing it."""
+        request = urllib.request.Request(
+            UPDATE_API_URL,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": f"SubtitleUniverseSpellcheck/{current_version}",
+            },
+        )
+        try:
+            with opener(request, timeout=timeout) as response:
+                _validated_update_url(response.geturl())
+                raw_metadata = _read_limited_response(response, UPDATE_METADATA_LIMIT, "release metadata")
+            metadata = json.loads(raw_metadata.decode("utf-8"))
+        except UpdateError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError, urllib.error.URLError) as error:
+            raise UpdateError("The release information could not be checked.") from error
+        if not isinstance(metadata, dict) or metadata.get("draft") or metadata.get("prerelease"):
+            raise UpdateError("The update service returned invalid release information.")
+        tag = str(metadata.get("tag_name", "")).strip()
+        version = tag[1:] if tag.casefold().startswith("v") else tag
+        try:
+            newer = is_newer_version(version, current_version)
+        except ValueError as error:
+            raise UpdateError("The release uses an unsupported version number.") from error
+        if not newer:
+            return None
+
+        is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+        runtime_platform = sys.platform if platform_name is None else platform_name
+        if is_frozen and runtime_platform == "win32":
+            runtime_machine = platform.machine() if machine is None else machine
+            architecture_key = runtime_machine.casefold().replace("_", "-")
+            architecture = {
+                "amd64": "x64",
+                "x86-64": "x64",
+                "x64": "x64",
+                "arm64": "arm64",
+                "aarch64": "arm64",
+                "x86": "x86",
+                "i386": "x86",
+                "i686": "x86",
+            }.get(architecture_key, architecture_key)
+            asset_name = f"SubtitleUniverseSpellcheck-{version}-windows-{architecture}.zip"
+        else:
+            asset_name = f"SubtitleUniverseSpellcheck-{version}-source.zip"
+        checksum_name = asset_name + ".sha256"
+
+        assets_by_name: Dict[str, ReleaseAsset] = {}
+        assets = metadata.get("assets")
+        if not isinstance(assets, list):
+            raise UpdateError("The release does not contain a usable asset list.")
+        for item in assets:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", ""))
+            url = str(item.get("browser_download_url", ""))
+            try:
+                size = int(item.get("size", 0))
+            except (TypeError, ValueError):
+                continue
+            if name in {asset_name, checksum_name}:
+                _validated_update_url(url, project_asset=True)
+                assets_by_name[name] = ReleaseAsset(name, url, size, item.get("digest"))
+        if asset_name not in assets_by_name or checksum_name not in assets_by_name:
+            raise UpdateError(f"Release {version} does not provide {asset_name} and its checksum.")
+        asset = assets_by_name[asset_name]
+        checksum_asset = assets_by_name[checksum_name]
+        if asset.size < 1 or asset.size > UPDATE_ARCHIVE_LIMIT:
+            raise UpdateError("The update archive has an invalid size.")
+        if checksum_asset.size < 1 or checksum_asset.size > UPDATE_CHECKSUM_LIMIT:
+            raise UpdateError("The update checksum has an invalid size.")
+        return ReleaseUpdate(
+            version,
+            tag,
+            str(metadata.get("name") or tag),
+            _validated_update_url(str(metadata.get("html_url", ""))),
+            str(metadata.get("body") or ""),
+            asset,
+            checksum_asset,
+        )
+
+    def download_update(
+        self,
+        update: ReleaseUpdate,
+        destination: Path,
+        *,
+        opener=urllib.request.urlopen,
+        timeout: float = UPDATE_TIMEOUT_SECONDS,
+    ) -> Tuple[Path, Path]:
+        """Download and verify an update ZIP without replacing application files."""
+        destination = Path(destination)
+        if destination.suffix.casefold() != ".zip":
+            raise UpdateError("The update download must be saved as a ZIP file.")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        archive_part = Path(str(destination) + ".part")
+        checksum_path = Path(str(destination) + ".sha256")
+        checksum_part = Path(str(checksum_path) + ".part")
+        for temporary in (archive_part, checksum_part):
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            checksum_request = urllib.request.Request(
+                _validated_update_url(update.checksum_asset.url, project_asset=True),
+                headers={"User-Agent": f"SubtitleUniverseSpellcheck/{SCRIPT_VERSION}"},
+            )
+            with opener(checksum_request, timeout=timeout) as response:
+                _validated_update_url(response.geturl())
+                checksum_data = _read_limited_response(response, UPDATE_CHECKSUM_LIMIT, "checksum")
+            checksum_match = re.search(rb"(?i)(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])", checksum_data)
+            if checksum_match is None:
+                raise UpdateError("The published checksum is invalid.")
+            expected_digest = checksum_match.group(1).decode("ascii").casefold()
+            if update.asset.digest:
+                api_digest = str(update.asset.digest).casefold()
+                if not api_digest.startswith("sha256:") or api_digest[7:] != expected_digest:
+                    raise UpdateError("The published checksum conflicts with the release metadata.")
+
+            archive_request = urllib.request.Request(
+                _validated_update_url(update.asset.url, project_asset=True),
+                headers={"User-Agent": f"SubtitleUniverseSpellcheck/{SCRIPT_VERSION}"},
+            )
+            digest = hashlib.sha256()
+            total = 0
+            with opener(archive_request, timeout=timeout) as response, archive_part.open("wb") as handle:
+                _validated_update_url(response.geturl())
+                raw_length = response.headers.get("Content-Length") if getattr(response, "headers", None) else None
+                if raw_length and int(raw_length) > UPDATE_ARCHIVE_LIMIT:
+                    raise UpdateError("The update archive exceeds the allowed size.")
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > UPDATE_ARCHIVE_LIMIT:
+                        raise UpdateError("The update archive exceeds the allowed size.")
+                    digest.update(chunk)
+                    handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if update.asset.size and total != update.asset.size:
+                raise UpdateError("The downloaded archive size does not match the release metadata.")
+            if digest.hexdigest().casefold() != expected_digest:
+                raise UpdateError("The downloaded archive checksum does not match the published checksum.")
+            try:
+                with zipfile.ZipFile(archive_part, "r") as archive:
+                    members = archive.infolist()
+                    if not members:
+                        raise UpdateError("The downloaded update ZIP is empty.")
+                    for member in members:
+                        path = PurePosixPath(member.filename.replace("\\", "/"))
+                        if path.is_absolute() or ".." in path.parts:
+                            raise UpdateError("The downloaded update ZIP contains an unsafe path.")
+                    if archive.testzip() is not None:
+                        raise UpdateError("The downloaded update ZIP is damaged.")
+            except zipfile.BadZipFile as error:
+                raise UpdateError("The downloaded update is not a valid ZIP file.") from error
+
+            with checksum_part.open("w", encoding="ascii", newline="\n") as handle:
+                handle.write(f"{expected_digest}  {destination.name}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(archive_part, destination)
+            os.replace(checksum_part, checksum_path)
+            return destination, checksum_path
+        except UpdateError:
+            raise
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            raise UpdateError("The update ZIP could not be downloaded and verified.") from error
+        finally:
+            for temporary in (archive_part, checksum_part):
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def check_for_updates_cli(self) -> None:
+        """Offer a verified ZIP download at CLI startup; failures remain nonfatal."""
+        if not getattr(self, "update_check_preference_confirmed", False):
+            print(
+                "\nSubtitle Universe Spellcheck can check the public GitHub Releases "
+                "page for newer versions when it starts. No network request has been "
+                "made yet."
+            )
+            enabled = input("Allow automatic update checks at startup? [y/N]: ").strip().casefold() in {
+                "y",
+                "yes",
+            }
+            try:
+                self.set_option_value("check_for_updates_at_startup", enabled)
+            except OSError as error:
+                print(f"The update-check preference could not be saved: {error}")
+                return
+        if not self.options.get("check_for_updates_at_startup", False):
+            return
+        try:
+            update = self.check_for_update()
+        except UpdateError:
+            return
+        if update is None:
+            return
+        print(f"\nVersion {update.version} is available: {update.name}")
+        print(update.page_url)
+        print("Stage 1 downloads a verified ZIP only; it does not install or replace files.")
+        if input("Download this update ZIP now? [y/N]: ").strip().casefold() not in {"y", "yes"}:
+            return
+        default_directory = Path.home() / "Downloads"
+        if not default_directory.is_dir():
+            default_directory = self.script_dir
+        default_path = default_directory / update.asset.name
+        chosen = input(f"Save as [{default_path}]: ").strip()
+        destination = Path(chosen).expanduser() if chosen else default_path
+        try:
+            archive_path, checksum_path = self.download_update(update, destination)
+        except UpdateError as error:
+            print(f"Update download failed: {error}")
+            return
+        print(f"Downloaded and verified: {archive_path}")
+        print(f"Checksum: {checksum_path}")
 
     # ------------------------------------------------------------------
     # Logs / state
@@ -666,6 +1190,8 @@ class SubtitleCleanupTool:
         self.session_log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.session_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def load_session_state(self) -> dict:
         if not self.session_state_path.exists():
@@ -680,32 +1206,28 @@ class SubtitleCleanupTool:
         state["last_updated_at"] = now_iso()
         state["schema_version"] = SCHEMA_VERSION
         self.session_state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = self.session_state_path.with_name(self.session_state_path.name + ".tmp")
-        try:
-            temporary_path.write_text(
-                json.dumps(state, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            for attempt in range(6):
-                try:
-                    os.replace(temporary_path, self.session_state_path)
-                    break
-                except PermissionError:
-                    if attempt == 5:
-                        raise
-                    time.sleep(0.05 * (2 ** attempt))
-        finally:
-            if temporary_path.exists():
-                temporary_path.unlink()
+        self.atomic_write_text(
+            self.session_state_path,
+            json.dumps(state, indent=2, ensure_ascii=False),
+        )
+
+    def clear_session_log(self) -> None:
+        """Atomically clear history without touching dictionaries or recovery."""
+        self.atomic_write_text(self.session_log_path, "")
+
+    def show_flush_session_log_help(self) -> None:
+        clear_screen()
+        print("Flush session log — Help\n")
+        print(SESSION_LOG_HELP)
+        pause()
 
     def flush_session_log(self) -> None:
         clear_screen()
         print("Flush session log")
-        print("This clears dictionaries/session_log.jsonl. It does not remove dictionary entries.")
-        print("It also does not clear or abandon an interrupted spellcheck session.")
+        print(SESSION_LOG_HELP)
         choice = input("Type FLUSH to confirm, or press Enter to go back: ").strip()
         if choice == "FLUSH":
-            self.session_log_path.write_text("", encoding="utf-8")
+            self.clear_session_log()
             print("Session log flushed.")
             pause()
 
@@ -723,6 +1245,7 @@ class SubtitleCleanupTool:
             print("1. Adjust formatting only")
             print("2. Run standard spellcheck with formatting correction")
             print("3. Run spellcheck with optional universe dictionary and formatting correction")
+            print("R. Restore subtitles from backup ZIPs")
             print("\nDictionary Maintenance:")
             print("4. Review recent dictionary additions")
             print("5. Review recent substitution additions")
@@ -732,7 +1255,7 @@ class SubtitleCleanupTool:
             print("\nInfo/Maintenance:")
             print("9. What do Base, User, and Universe mean?")
             print("10. About this tool")
-            print("11. Flush session log")
+            print("11. Flush session log [enter 11? for help]")
             print("\n0. Exit")
             choice = input("\nEnter a menu option: ").strip()
             if choice == "1":
@@ -741,6 +1264,8 @@ class SubtitleCleanupTool:
                 self.run_spellcheck(use_universe=False)
             elif choice == "3":
                 self.run_spellcheck(use_universe=True)
+            elif choice.casefold() == "r":
+                self.restore_subtitles_from_backup_cli()
             elif choice == "4":
                 self.review_recent_dictionary_additions()
             elif choice == "5":
@@ -757,6 +1282,8 @@ class SubtitleCleanupTool:
                 self.show_about_screen()
             elif choice == "11":
                 self.flush_session_log()
+            elif choice == "11?":
+                self.show_flush_session_log_help()
             elif choice == "0":
                 return
             else:
@@ -769,9 +1296,9 @@ class SubtitleCleanupTool:
         print("Base Dictionary")
         print("  Broad American or British English dictionary. It is read-only for this tool.")
         print("\nUser Dictionary")
-        print("  Your personal always-loaded words, names, and substitutions for the selected language.")
+        print("  Your personal always-loaded words, names, acronyms, and substitutions for the selected language.")
         print("\nUniverse Dictionary")
-        print("  Optional project/franchise-specific words, names, and substitutions. Despite sounding broad,")
+        print("  Optional project/franchise-specific words, names, acronyms, and substitutions. Despite sounding broad,")
         print("  Universe is the narrowest scope in this tool, as in a specific fictional/project universe.")
         pause()
 
@@ -786,6 +1313,15 @@ class SubtitleCleanupTool:
         print("recover from interrupted spellcheck sessions, and review recent additions.")
         print("\nIt is designed to avoid unsafe automatic spelling guesses. Formatting rules and explicit")
         print("substitutions can be automatic; unknown spelling issues are presented interactively.")
+        print("\nProject page")
+        print(f"  {PROJECT_URL}")
+        print("\nApplication source: MIT License")
+        print("\nSCOWL dictionary credit")
+        print(SCOWL_CREDIT)
+        print("\nSCOWL 2026.02.25 source page")
+        print(f"  {SCOWL_URL}")
+        print("\nComplete bundled notice")
+        print("  dictionaries/base/SCOWL-COPYRIGHT.txt")
         pause()
 
     # ------------------------------------------------------------------
@@ -852,6 +1388,25 @@ class SubtitleCleanupTool:
         clear_screen()
         print(f"Change option: {OPTION_LABELS[key]}")
         print(f"Current value: {current}\n")
+        if (
+            self.options.get("capitalization_mode") == "all_caps"
+            and key in CAPITALIZATION_DEPENDENT_OPTIONS
+        ):
+            print("This option is not available in All caps mode.")
+            print("Change Capitalization preference first to adjust it.")
+            pause()
+            return
+        if key == "capitalization_mode":
+            for index, label in enumerate(CAPITALIZATION_MODES.values(), start=1):
+                print(f"{index}. {label}")
+            raw = input("\nChoice, or press Enter to cancel: ").strip()
+            if not raw.isdigit() or not (1 <= int(raw) <= len(CAPITALIZATION_MODES)):
+                if raw:
+                    print("Choose a listed capitalization preference.")
+                    pause()
+                return
+            self.set_option_value(key, tuple(CAPITALIZATION_MODES)[int(raw) - 1])
+            return
         if isinstance(DEFAULT_OPTIONS[key], bool):
             value = input("Enter yes/no, true/false, y/n, t/f, or press Enter to cancel: ").strip()
             if not value:
@@ -912,16 +1467,207 @@ class SubtitleCleanupTool:
         ctx.base_words = self.load_word_set(self.base_dir / f"{language}_words.txt")
         ctx.user_words = self.load_word_set(self.user_dir / f"{language}_words.txt")
         ctx.user_names = self.load_name_map(self.user_dir / f"{language}_names.txt")
+        ctx.user_acronyms = self.load_acronym_set(
+            self.user_dir / f"{language}_acronyms.txt"
+        )
         ctx.user_substitutions = self.load_substitutions(self.user_dir / f"{language}_substitutions.tsv")
         ctx.substitutions.update(ctx.user_substitutions)
         if universe:
             u_dir = self.universe_dir / universe
             ctx.universe_words = self.load_word_set(u_dir / "words.txt")
             ctx.universe_names = self.load_name_map(u_dir / "names.txt")
+            ctx.universe_acronyms = self.load_acronym_set(u_dir / "acronyms.txt")
             ctx.universe_substitutions = self.load_substitutions(u_dir / "substitutions.tsv")
             ctx.substitutions.update(ctx.universe_substitutions)
+        ctx.acronym_set.update(ctx.explicit_acronyms)
         ctx.acronym_set.update(self.derive_acronyms(ctx))
         return ctx
+
+    def load_acronym_set(self, path: Path) -> set:
+        if not path.exists():
+            return set()
+        return {
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+
+    def validate_acronym_entry(self, value: str) -> str:
+        value = value.strip()
+        if value.casefold() in {"am", "pm"}:
+            raise ValueError(
+                "AM and PM are already handled contextually as time expressions "
+                "and cannot be added to an acronym dictionary."
+            )
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", value):
+            raise ValueError(
+                "An acronym must be one undotted token containing only letters and numbers."
+            )
+        if len(value) < 2:
+            raise ValueError("An acronym must contain at least two characters.")
+        return value
+
+    def acronym_word_conflicts(
+        self,
+        value: str,
+        context: DictionaryContext,
+    ) -> List[str]:
+        """Return active word/name layers that also contain an acronym token."""
+        key = dictionary_key(value)
+        language_label = f"{context.language.title()} English"
+        conflicts = []
+        if key in context.base_words:
+            conflicts.append(f"{language_label} Base Dictionary")
+        if key in context.user_words or key in context.user_names:
+            conflicts.append(f"{language_label} User Dictionary")
+        if context.universe and (
+            key in context.universe_words or key in context.universe_names
+        ):
+            conflicts.append(f"{context.universe} Universe Dictionary")
+        return conflicts
+
+    def acronym_word_conflicts_for_location(
+        self,
+        value: str,
+        target: str,
+        *,
+        language: Optional[str] = None,
+        universe: Optional[str] = None,
+    ) -> List[str]:
+        """Check word layers relevant to a maintenance destination."""
+        if target == "user":
+            if language not in {"american", "british"}:
+                raise ValueError("Choose American or British English first.")
+            contexts = [self.load_dictionary_context(language)]
+            universe_names = self.list_universes()
+        elif target == "universe" and universe:
+            # A Universe may be paired with either Base language, so check both.
+            contexts = [
+                self.load_dictionary_context(active_language)
+                for active_language in ("american", "british")
+            ]
+            universe_names = [universe]
+        else:
+            raise ValueError("Choose a dictionary destination first.")
+        conflicts = []
+        for context in contexts:
+            for label in self.acronym_word_conflicts(value, context):
+                if label not in conflicts:
+                    conflicts.append(label)
+        key = dictionary_key(value)
+        for universe_name in universe_names:
+            words = self.load_word_set(
+                self.universe_dir / universe_name / "words.txt"
+            )
+            names = self.load_name_map(
+                self.universe_dir / universe_name / "names.txt"
+            )
+            label = f"{universe_name} Universe Dictionary"
+            if (key in words or key in names) and label not in conflicts:
+                conflicts.append(label)
+        return conflicts
+
+    def word_acronym_conflicts(
+        self,
+        value: str,
+        context: DictionaryContext,
+    ) -> List[str]:
+        """Return active acronym layers that also contain an accepted word."""
+        key = dictionary_key(value)
+        language_label = f"{context.language.title()} English"
+        conflicts = []
+        if any(dictionary_key(acronym) == key for acronym in COMMON_ACRONYMS):
+            conflicts.append("Built-in common acronym handling")
+        if any(dictionary_key(acronym) == key for acronym in context.user_acronyms):
+            conflicts.append(f"{language_label} User Dictionary")
+        if context.universe and any(
+            dictionary_key(acronym) == key
+            for acronym in context.universe_acronyms
+        ):
+            conflicts.append(f"{context.universe} Universe Dictionary")
+        return conflicts
+
+    def word_acronym_conflicts_for_location(
+        self,
+        value: str,
+        target: str,
+        *,
+        language: Optional[str] = None,
+        universe: Optional[str] = None,
+    ) -> List[str]:
+        """Check acronym layers relevant to a word-maintenance destination."""
+        if target == "user":
+            if language not in {"american", "british"}:
+                raise ValueError("Choose American or British English first.")
+            contexts = [self.load_dictionary_context(language)]
+            universe_names = self.list_universes()
+        elif target == "universe" and universe:
+            contexts = [
+                self.load_dictionary_context(active_language)
+                for active_language in ("american", "british")
+            ]
+            universe_names = [universe]
+        else:
+            raise ValueError("Choose a dictionary destination first.")
+        conflicts = []
+        for context in contexts:
+            for label in self.word_acronym_conflicts(value, context):
+                if label not in conflicts:
+                    conflicts.append(label)
+        key = dictionary_key(value)
+        for universe_name in universe_names:
+            acronyms = self.load_acronym_set(
+                self.universe_dir / universe_name / "acronyms.txt"
+            )
+            label = f"{universe_name} Universe Dictionary"
+            if any(dictionary_key(acronym) == key for acronym in acronyms):
+                if label not in conflicts:
+                    conflicts.append(label)
+        return conflicts
+
+    def confirm_acronym_word_conflict(
+        self,
+        value: str,
+        conflicts: Sequence[str],
+    ) -> bool:
+        """Ask the CLI user whether an acronym/word collision is intentional."""
+        if not conflicts:
+            return True
+        print(
+            f'Warning: "{value}" is already accepted as a word in '
+            + ", ".join(conflicts)
+            + "."
+        )
+        print(
+            "Adding it as an acronym will make the stored acronym casing "
+            "authoritative when that dictionary is active."
+        )
+        return input("Add this acronym anyway? [y/N]: ").strip().casefold() in {
+            "y",
+            "yes",
+        }
+
+    def confirm_word_acronym_conflict(
+        self,
+        value: str,
+        conflicts: Sequence[str],
+    ) -> bool:
+        """Ask the CLI user whether a word/acronym collision is intentional."""
+        if not conflicts:
+            return True
+        print(
+            f'Warning: "{value}" is already handled as an acronym in '
+            + ", ".join(conflicts)
+            + "."
+        )
+        print(
+            "Adding it as a word or name creates overlapping dictionary meanings; "
+            "acronym casing remains authoritative when applicable."
+        )
+        return input("Add this dictionary entry anyway? [y/N]: ").strip().casefold() in {
+            "y",
+            "yes",
+        }
 
     def derive_acronyms(self, ctx: DictionaryContext) -> set:
         acronyms = set()
@@ -937,7 +1683,11 @@ class SubtitleCleanupTool:
     def load_word_set(self, path: Path) -> set:
         if not path.exists():
             return set()
-        return {line.strip().casefold() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
+        return {
+            dictionary_key(line.strip())
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
 
     def load_name_map(self, path: Path) -> Dict[str, str]:
         if not path.exists():
@@ -946,7 +1696,7 @@ class SubtitleCleanupTool:
         for line in path.read_text(encoding="utf-8").splitlines():
             item = line.strip()
             if item:
-                result[item.casefold()] = item
+                result[dictionary_key(item)] = item
         return result
 
     def load_substitutions(self, path: Path) -> Dict[str, str]:
@@ -965,7 +1715,8 @@ class SubtitleCleanupTool:
 
     def save_word_list(self, path: Path, values: Iterable[str]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(sorted_unique(values)) + ("\n" if values else ""), encoding="utf-8")
+        ordered = sorted_unique(values)
+        self.atomic_write_text(path, "\n".join(ordered) + ("\n" if ordered else ""))
 
     def save_substitutions(self, path: Path, substitutions: Dict[str, str]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -976,7 +1727,9 @@ class SubtitleCleanupTool:
             if key and value:
                 rows.append((key, value))
         rows.sort(key=lambda row: row[0].casefold())
-        path.write_text("".join(f"{left}\t{right}\n" for left, right in rows), encoding="utf-8")
+        self.atomic_write_text(
+            path, "".join(f"{left}\t{right}\n" for left, right in rows)
+        )
 
     def add_word_to_file(self, path: Path, word: str, event: Optional[dict] = None) -> bool:
         word = word.strip()
@@ -985,7 +1738,7 @@ class SubtitleCleanupTool:
         existing = []
         if path.exists():
             existing = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if word.casefold() not in {x.casefold() for x in existing}:
+        if dictionary_key(word) not in {dictionary_key(x) for x in existing}:
             existing.append(word.strip())
             self.save_word_list(path, existing)
             if event:
@@ -1196,6 +1949,154 @@ class SubtitleCleanupTool:
             groups.setdefault(backup_root, []).append(subtitle_path)
         return groups
 
+    def find_backup_archives(self, target_root: Path) -> List[Path]:
+        """Find only archives produced by the grouped subtitle-backup workflow."""
+        if not target_root.exists() or not target_root.is_dir():
+            return []
+        candidates = [target_root / "backup_subtitles.zip"]
+        try:
+            candidates.extend(
+                path / "backup_subtitles.zip"
+                for path in target_root.iterdir()
+                if path.is_dir()
+            )
+        except OSError:
+            return []
+        return sorted(
+            (path for path in candidates if path.is_file()),
+            key=lambda path: str(path).casefold(),
+        )
+
+    def restore_backup_archives(self, target_root: Path) -> Tuple[int, int]:
+        """Validate, then atomically restore all subtitle files from grouped archives."""
+        archives = self.find_backup_archives(target_root)
+        if not archives:
+            raise ValueError("No backup_subtitles.zip archives were found.")
+
+        prepared: List[Tuple[Path, bytes]] = []
+        destinations = set()
+        for archive_path in archives:
+            backup_root = archive_path.parent.resolve()
+            try:
+                with zipfile.ZipFile(archive_path, "r") as archive:
+                    bad_entry = archive.testzip()
+                    if bad_entry is not None:
+                        raise ValueError(
+                            f"Backup archive is damaged at {bad_entry}: {archive_path}"
+                        )
+                    entries = [item for item in archive.infolist() if not item.is_dir()]
+                    if not entries:
+                        raise ValueError(f"Backup archive contains no files: {archive_path}")
+                    for item in entries:
+                        relative = PurePosixPath(item.filename)
+                        if (
+                            relative.is_absolute()
+                            or ".." in relative.parts
+                            or any(":" in part for part in relative.parts)
+                            or relative.suffix.casefold() != ".srt"
+                        ):
+                            raise ValueError(
+                                f"Backup contains an unsafe path: {item.filename}"
+                            )
+                        destination = backup_root.joinpath(*relative.parts).resolve()
+                        try:
+                            destination.relative_to(backup_root)
+                        except ValueError as error:
+                            raise ValueError(
+                                f"Backup contains an unsafe path: {item.filename}"
+                            ) from error
+                        key = str(destination).casefold()
+                        if key in destinations:
+                            raise ValueError(
+                                f"Backup contains a duplicate subtitle path: {destination}"
+                            )
+                        destinations.add(key)
+                        prepared.append((destination, archive.read(item)))
+            except zipfile.BadZipFile as error:
+                raise ValueError(f"Backup archive is not a valid ZIP: {archive_path}") from error
+
+        originals = {
+            path: path.read_bytes() if path.exists() else None for path, _data in prepared
+        }
+        written: List[Path] = []
+        try:
+            for path, data in prepared:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self.atomic_write_bytes(path, data)
+                written.append(path)
+        except Exception as error:
+            rollback_error = None
+            for path in reversed(written):
+                try:
+                    original = originals[path]
+                    if original is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        self.atomic_write_bytes(path, original)
+                except Exception as candidate:
+                    rollback_error = candidate
+            if rollback_error is not None:
+                raise RuntimeError(
+                    "Restoration failed and at least one subtitle could not be rolled back."
+                ) from error
+            raise RuntimeError("Restoration failed; changed files were rolled back.") from error
+        return len(archives), len(prepared)
+
+    def restore_subtitles_from_backup_cli(self) -> None:
+        clear_screen()
+        target = self.select_target_folder("Restore subtitles from backup ZIPs")
+        if not target:
+            return
+        archives = self.find_backup_archives(target)
+        if not archives:
+            print("No backup_subtitles.zip archives were found in the selected folder or its immediate child folders.")
+            pause()
+            return
+        print(f"\nFound {len(archives)} backup archive(s).")
+        print("This will overwrite current subtitle files and cannot be undone from within the tool.")
+        confirmation = input("Type YES to restore, or press Enter to cancel: ").strip()
+        if confirmation != "YES":
+            print("Restore cancelled; no subtitle files were changed.")
+            pause()
+            return
+        try:
+            archive_count, file_count = self.restore_backup_archives(target)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"Restore failed: {error}")
+        else:
+            print(f"Restored {file_count} subtitle file(s) from {archive_count} archive(s).")
+            print("The backup archives were retained.")
+        pause()
+
+    def create_backup_archive(
+        self, backup_root: Path, files: Sequence[Path]
+    ) -> Tuple[Path, bool]:
+        """Create one flushed grouped archive, or retain the existing archive."""
+        backup_path = backup_root / "backup_subtitles.zip"
+        if backup_path.exists():
+            return backup_path, False
+        temporary_path = backup_path.with_name(f".{backup_path.name}.tmp")
+        try:
+            temporary_path.unlink(missing_ok=True)
+            with zipfile.ZipFile(
+                temporary_path, "w", compression=zipfile.ZIP_DEFLATED
+            ) as zf:
+                for subtitle_path in sorted(
+                    files,
+                    key=lambda p: str(p.relative_to(backup_root)).casefold(),
+                ):
+                    zf.write(subtitle_path, subtitle_path.relative_to(backup_root))
+            with temporary_path.open("r+b") as handle:
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, backup_path)
+            return backup_path, True
+        finally:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def create_backup_if_needed(self, target_root: Path, files: Sequence[Path]) -> bool:
         if not self.options["create_backup_subtitles_zip_before_editing"]:
             clear_screen()
@@ -1218,32 +2119,20 @@ class SubtitleCleanupTool:
         print("\nPreparing subtitle backups:")
         all_succeeded = True
         for backup_root in sorted(groups, key=lambda p: str(p).casefold()):
-            backup_path = backup_root / "backup_subtitles.zip"
-            if backup_path.exists():
-                print(f"- Existing backup retained: {backup_path}")
-                continue
-            temporary_path = backup_path.with_name(f".{backup_path.name}.tmp")
             try:
-                temporary_path.unlink(missing_ok=True)
-                with zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    for subtitle_path in sorted(
-                        groups[backup_root],
-                        key=lambda p: str(p.relative_to(backup_root)).casefold(),
-                    ):
-                        zf.write(subtitle_path, subtitle_path.relative_to(backup_root))
-                with temporary_path.open("r+b") as handle:
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temporary_path, backup_path)
-                print(f"- Created: {backup_path}")
+                backup_path, created = self.create_backup_archive(
+                    backup_root, groups[backup_root]
+                )
+                print(
+                    f"- {'Created' if created else 'Existing backup retained'}: "
+                    f"{backup_path}"
+                )
             except (OSError, zipfile.BadZipFile) as exc:
-                print(f"- ERROR: Could not create {backup_path}: {exc}")
+                print(
+                    f"- ERROR: Could not create "
+                    f"{backup_root / 'backup_subtitles.zip'}: {exc}"
+                )
                 all_succeeded = False
-            finally:
-                try:
-                    temporary_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
         return all_succeeded
 
     # ------------------------------------------------------------------
@@ -1310,8 +2199,11 @@ class SubtitleCleanupTool:
         priorities = {"\r\n": 2, "\n": 1, "\r": 0}
         return max(counts, key=lambda value: (counts[value], priorities[value]))
 
-    def parse_srt(self, path: Path) -> List[SubtitleBlock]:
-        text, file_format = self.decode_subtitle_bytes(path.read_bytes())
+    def parse_srt(
+        self, path: Path, source_bytes: Optional[bytes] = None
+    ) -> List[SubtitleBlock]:
+        raw = path.read_bytes() if source_bytes is None else source_bytes
+        text, file_format = self.decode_subtitle_bytes(raw)
         formats = getattr(self, "subtitle_file_formats", None)
         if formats is None:
             formats = {}
@@ -1355,7 +2247,8 @@ class SubtitleCleanupTool:
             ))
         return blocks
 
-    def write_srt(self, path: Path, blocks: Sequence[SubtitleBlock]) -> None:
+    def encode_srt(self, path: Path, blocks: Sequence[SubtitleBlock]) -> bytes:
+        """Render blocks using the source file's encoding and newline details."""
         formats = getattr(self, "subtitle_file_formats", {})
         default_newline = "\r\n" if os.name == "nt" else "\n"
         file_format = formats.get(str(path), SubtitleFileFormat(
@@ -1367,7 +2260,10 @@ class SubtitleCleanupTool:
         if output:
             output += file_format.terminal_newlines
         encoded = output.encode(file_format.encoding)
-        self.atomic_write_bytes(path, file_format.bom + encoded)
+        return file_format.bom + encoded
+
+    def write_srt(self, path: Path, blocks: Sequence[SubtitleBlock]) -> None:
+        self.atomic_write_bytes(path, self.encode_srt(path, blocks))
 
     def atomic_write_bytes(self, path: Path, data: bytes) -> None:
         """Flush a complete sibling file before atomically replacing the target."""
@@ -1384,7 +2280,14 @@ class SubtitleCleanupTool:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary_path, path)
+            for attempt in range(6):
+                try:
+                    os.replace(temporary_path, path)
+                    break
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.05 * (2 ** attempt))
         finally:
             if temporary_path is not None:
                 try:
@@ -1392,10 +2295,269 @@ class SubtitleCleanupTool:
                 except OSError:
                     pass
 
+    def atomic_write_text(self, path: Path, text: str) -> None:
+        """Publish a complete UTF-8 text file without exposing a partial rewrite."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.atomic_write_bytes(path, text.encode("utf-8"))
+
+    @staticmethod
+    def _review_issue_payload(issue: Optional[SpellcheckIssuePreview]) -> Optional[dict]:
+        if issue is None:
+            return None
+        return {
+            "path": str(issue.path),
+            "relative_file": issue.relative_file,
+            "file_number": issue.file_number,
+            "total_files": issue.total_files,
+            "subtitle_index": issue.subtitle_index,
+            "total_subtitles": issue.total_subtitles,
+            "word": issue.word,
+            "line_index": issue.line_index,
+            "start": issue.start,
+            "end": issue.end,
+            "suggestions": list(issue.suggestions),
+            "previous_blocks": list(issue.previous_blocks),
+            "current_block": issue.current_block,
+            "current_text": issue.current_text,
+            "timestamp": issue.timestamp,
+            "next_blocks": list(issue.next_blocks),
+        }
+
+    @staticmethod
+    def _review_issue_from_payload(payload: Optional[dict]) -> Optional[SpellcheckIssuePreview]:
+        if payload is None:
+            return None
+        return SpellcheckIssuePreview(
+            path=Path(payload["path"]),
+            relative_file=str(payload["relative_file"]),
+            file_number=int(payload["file_number"]),
+            total_files=int(payload["total_files"]),
+            subtitle_index=int(payload["subtitle_index"]),
+            total_subtitles=int(payload["total_subtitles"]),
+            word=str(payload["word"]),
+            line_index=int(payload["line_index"]),
+            start=int(payload["start"]),
+            end=int(payload["end"]),
+            suggestions=tuple(payload.get("suggestions", ())),
+            previous_blocks=tuple(payload.get("previous_blocks", ())),
+            current_block=str(payload.get("current_block", "")),
+            current_text=str(payload.get("current_text", "")),
+            timestamp=str(payload.get("timestamp", "")),
+            next_blocks=tuple(payload.get("next_blocks", ())),
+        )
+
+    @staticmethod
+    def _review_block_payload(block: SubtitleBlock) -> dict:
+        return {
+            "index": block.index,
+            "timestamp": block.timestamp,
+            "text_lines": list(block.text_lines),
+            "original_lines": list(block.original_lines),
+            "has_index": block.has_index,
+            "has_timestamp": block.has_timestamp,
+        }
+
+    @staticmethod
+    def _review_block_from_payload(payload: dict) -> SubtitleBlock:
+        return SubtitleBlock(
+            index=str(payload["index"]),
+            timestamp=str(payload["timestamp"]),
+            text_lines=[str(value) for value in payload.get("text_lines", ())],
+            original_lines=[str(value) for value in payload.get("original_lines", ())],
+            has_index=bool(payload.get("has_index", True)),
+            has_timestamp=bool(payload.get("has_timestamp", True)),
+        )
+
+    def save_gui_review_session(
+        self, session: SpellcheckReviewSession, *, paused: bool = False
+    ) -> None:
+        """Atomically checkpoint a GUI review for crash or power-loss recovery."""
+        prepared = {}
+        source_hashes = {}
+        for file_index, blocks in session.prepared_blocks.items():
+            source = session.source_bytes.get(file_index)
+            if source is None:
+                raise RuntimeError("A prepared subtitle is missing its recovery baseline.")
+            prepared[str(file_index)] = [
+                self._review_block_payload(block) for block in blocks
+            ]
+            source_hashes[str(file_index)] = hashlib.sha256(source).hexdigest()
+        undo = []
+        for action in session.undo_actions:
+            undo.append({
+                "kind": action.kind,
+                "issue": self._review_issue_payload(action.issue),
+                "before_text_lines": list(action.before_text_lines),
+                "dictionary_effect": action.dictionary_effect,
+                "replacement_effect": action.replacement_effect,
+            })
+        payload = {
+            "schema_version": 2,
+            "saved_at": now_iso(),
+            "target": str(session.target.resolve()),
+            "files": [str(path.resolve()) for path in session.files],
+            "language": session.context.language,
+            "universe": session.context.universe,
+            "mode": session.mode,
+            "options_snapshot": session.options_snapshot,
+            "prepared_blocks": prepared,
+            "source_hashes": source_hashes,
+            "ignored_occurrences": [list(value) for value in sorted(session.ignored_occurrences)],
+            "ignored_words": sorted(session.ignored_words),
+            "substitutions": session.substitutions,
+            "validation_findings": session.validation_findings,
+            "undo_actions": undo,
+            "file_index": session.file_index,
+            "subtitle_index": session.subtitle_index,
+            "current_issue": self._review_issue_payload(session.current_issue),
+            "paused": bool(paused),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        self.atomic_write_bytes(self.gui_session_state_path, gzip.compress(encoded))
+
+    def load_gui_review_session(self) -> Optional[SpellcheckReviewSession]:
+        """Restore a checkpoint only while every prepared source is unchanged."""
+        if not self.gui_session_state_path.exists():
+            return None
+        try:
+            raw = gzip.decompress(self.gui_session_state_path.read_bytes())
+            payload = json.loads(raw.decode("utf-8"))
+        except (OSError, EOFError, gzip.BadGzipFile, UnicodeError, json.JSONDecodeError) as error:
+            raise RuntimeError("The saved GUI recovery journal is unreadable.") from error
+        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2}:
+            raise RuntimeError("The saved GUI recovery journal uses an unsupported format.")
+        target = Path(payload["target"]).resolve()
+        files = tuple(Path(value).resolve() for value in payload.get("files", ()))
+        if not target.is_dir() or not files:
+            raise RuntimeError("The saved GUI review folder is no longer available.")
+        for path in files:
+            try:
+                path.relative_to(target)
+            except ValueError as error:
+                raise RuntimeError("The recovery journal contains a file outside its folder.") from error
+            if not path.is_file():
+                raise RuntimeError(f"A subtitle from the saved GUI review is missing: {path.name}")
+
+        context = self.load_dictionary_context(
+            str(payload["language"]), payload.get("universe")
+        )
+        self.apply_options_snapshot(payload.get("options_snapshot", {}))
+        session = self.create_spellcheck_review(files, target, context)
+        session.mode = str(payload.get("mode", "spellcheck"))
+        if session.mode not in {"spellcheck", "formatting"}:
+            raise RuntimeError("The recovery journal contains an invalid review mode.")
+        prepared_payload = payload.get("prepared_blocks", {})
+        source_hashes = payload.get("source_hashes", {})
+        for index_text, blocks_payload in prepared_payload.items():
+            file_index = int(index_text)
+            if not 0 <= file_index < len(files):
+                raise RuntimeError("The recovery journal contains an invalid file position.")
+            source = files[file_index].read_bytes()
+            if hashlib.sha256(source).hexdigest() != source_hashes.get(index_text):
+                raise RuntimeError(
+                    f"{files[file_index].name} changed since the GUI recovery journal was saved."
+                )
+            # Parsing registers the exact source encoding/newline metadata needed
+            # by the shared commit path; checkpointed blocks retain prepared edits.
+            self.parse_srt(files[file_index], source)
+            session.source_bytes[file_index] = source
+            session.prepared_blocks[file_index] = [
+                self._review_block_from_payload(value) for value in blocks_payload
+            ]
+        session.ignored_occurrences = {
+            tuple(value) for value in payload.get("ignored_occurrences", ())
+        }
+        session.ignored_words = set(payload.get("ignored_words", ()))
+        session.substitutions = {
+            str(key).casefold(): str(value)
+            for key, value in payload.get("substitutions", {}).items()
+        }
+        session.validation_findings = [
+            dict(value)
+            for value in payload.get("validation_findings", ())
+            if isinstance(value, dict)
+        ]
+        session.undo_actions = [
+            SpellcheckReviewUndoAction(
+                kind=str(value["kind"]),
+                issue=self._review_issue_from_payload(value["issue"]),
+                before_text_lines=tuple(value.get("before_text_lines", ())),
+                dictionary_effect=value.get("dictionary_effect"),
+                replacement_effect=value.get("replacement_effect"),
+            )
+            for value in payload.get("undo_actions", ())
+        ]
+        session.file_index = int(payload.get("file_index", 0))
+        session.subtitle_index = int(payload.get("subtitle_index", 0))
+        session.current_issue = self._review_issue_from_payload(payload.get("current_issue"))
+        session.recovery_paused = bool(payload.get("paused", False))
+        if (
+            session.mode == "spellcheck"
+            and session.current_issue is not None
+            and not session.recovery_paused
+        ):
+            # A journal may have been created by an older version or before a
+            # dictionary was updated. Rebuild the displayed issue using the
+            # current shared lookup rules rather than trusting stale UI data.
+            session.current_issue = None
+            self._advance_spellcheck_review(session)
+        return session
+
+    def clear_gui_review_session(self) -> None:
+        """Remove the recoverable GUI checkpoint after an explicit discard."""
+        try:
+            self.gui_session_state_path.unlink(missing_ok=True)
+        except OSError as error:
+            raise RuntimeError("The GUI recovery journal could not be removed.") from error
+
     # ------------------------------------------------------------------
     # Formatting
     # ------------------------------------------------------------------
+    def require_capitalization_mode_cli(self) -> bool:
+        """Resolve Ask always for one scan, optionally saving the selection."""
+        self._capitalization_choice_remembered = False
+        if self.options.get("capitalization_mode") in CAPITALIZATION_SCAN_MODES:
+            return True
+        clear_screen()
+        print("Choose a capitalization preference before starting this scan.\n")
+        for index, label in enumerate(CAPITALIZATION_SCAN_MODES.values(), start=1):
+            print(f"{index}. {label}")
+        print("0. Cancel")
+        while True:
+            raw = input("\nChoice: ").strip()
+            if raw == "0":
+                return False
+            if raw.isdigit() and 1 <= int(raw) <= len(CAPITALIZATION_SCAN_MODES):
+                mode = tuple(CAPITALIZATION_SCAN_MODES)[int(raw) - 1]
+                remember = input("Remember this choice for future scans? [y/N]: ").strip()
+                parsed = parse_bool(remember) if remember else False
+                if parsed:
+                    self.set_option_value("capitalization_mode", mode)
+                    self._capitalization_choice_remembered = True
+                else:
+                    self.options["capitalization_mode"] = mode
+                return True
+            print("Choose one of the listed capitalization preferences.")
+
     def run_formatting_only(self) -> None:
+        configured_options = dict(self.options)
+        self._capitalization_choice_remembered = False
+        try:
+            self._run_formatting_only()
+        finally:
+            remembered = bool(
+                getattr(self, "_capitalization_choice_remembered", False)
+            )
+            selected = self.options.get("capitalization_mode")
+            self.options = configured_options
+            if remembered:
+                self.options["capitalization_mode"] = selected
+
+    def _run_formatting_only(self) -> None:
+        if not self.require_capitalization_mode_cli():
+            return
         clear_screen()
         print("AUTO-SCAN DISPATCH ACTIVE: Option 1")
         print("Starting automatic subtitle discovery from the script folder...")
@@ -1463,6 +2625,16 @@ class SubtitleCleanupTool:
             else self.apply_active_substitutions
         )
         lines = [substitution_method(line, ctx) for line in lines]
+        capitalization_mode = self.options.get("capitalization_mode")
+        if capitalization_mode not in CAPITALIZATION_SCAN_MODES:
+            capitalization_mode = "subtitle"
+        if capitalization_mode == "all_caps":
+            lines = [self.transform_visible_text(line, str.upper) for line in lines]
+        if (
+            capitalization_mode == "subtitle"
+            and self.options["capitalize_lowercase_pronoun_i"]
+        ):
+            lines = [self.capitalize_pronoun_i(line) for line in lines]
         if self.options["remove_periods_from_abbreviations"]:
             lines = [
                 self.normalize_dotted_acronyms(
@@ -1472,15 +2644,21 @@ class SubtitleCleanupTool:
                 )
                 for index, line in enumerate(lines)
             ]
-        if self.options["title_case_bracketed_sound_effects"]:
+        if (
+            capitalization_mode == "subtitle"
+            and self.options["title_case_bracketed_sound_effects"]
+        ):
             lines = [self.title_case_bracketed_sound_effects(line, ctx) for line in lines]
-        if self.options["fix_mostly_uppercase_lines"]:
+        if capitalization_mode == "subtitle" and self.options["fix_mostly_uppercase_lines"]:
             lines = self.repair_mostly_uppercase_lines(lines, ctx, uppercase_source_flags)
-        lines = self.restore_multiword_name_casing_in_lines(lines, ctx)
+        if capitalization_mode == "subtitle":
+            lines = self.restore_multiword_name_casing_in_lines(lines, ctx)
         if self.options["detect_dropped_speaker_breaks"]:
             lines = self.detect_dropped_speaker_breaks_in_lines(lines)
         if self.options["adjust_subtitle_line_count"]:
             lines = self.reflow_subtitle_lines(lines)
+        if capitalization_mode == "subtitle":
+            lines = [self.restore_explicit_acronym_casing(line, ctx) for line in lines]
         return lines
 
     def apply_common_error_cleanup(self, text_lines: Sequence[str]) -> List[str]:
@@ -1530,6 +2708,26 @@ class SubtitleCleanupTool:
             for part in parts
         )
 
+    def capitalize_pronoun_i(self, line: str) -> str:
+        """Repair lowercase English pronoun I without touching markup or URLs."""
+        def repair_text(text: str) -> str:
+            parts = re.split(r"((?:https?://|www\.)[^\s<]+)", text, flags=re.IGNORECASE)
+            for index in range(0, len(parts), 2):
+                part = parts[index]
+                part = re.sub(
+                    r"(?<![A-Za-z])i(['’])(?i:(m|d|ll|ve))(?![A-Za-z])",
+                    lambda match: "I" + match.group(1) + match.group(2).lower(),
+                    part,
+                )
+                parts[index] = re.sub(
+                    r"(?<![A-Za-z])i(?![A-Za-z'’]|\.[eE]\.)",
+                    "I",
+                    part,
+                )
+            return "".join(parts)
+
+        return self.transform_visible_text(line, repair_text)
+
     def replace_known_sequences(self, text: str, replacements: Dict[str, str]) -> str:
         for source, destination in replacements.items():
             text = text.replace(source, destination)
@@ -1570,13 +2768,15 @@ class SubtitleCleanupTool:
         path: Path,
         target: Path,
         blocks: Sequence[SubtitleBlock],
+        findings: Optional[List[dict]] = None,
     ) -> None:
         if not self.options["report_suspicious_text"]:
             return
-        findings = getattr(self, "validation_findings", None)
         if findings is None:
-            findings = []
-            self.validation_findings = findings
+            findings = getattr(self, "validation_findings", None)
+            if findings is None:
+                findings = []
+                self.validation_findings = findings
         try:
             relative_path = str(path.relative_to(target))
         except ValueError:
@@ -1745,7 +2945,7 @@ class SubtitleCleanupTool:
             acronym_set = ctx.acronym_set if ctx is not None else COMMON_ACRONYMS
             preferred = preferred_acronym_casing(candidate, acronym_set)
             if preferred is None and ctx is not None:
-                preferred_name = ctx.name_map.get(candidate.casefold())
+                preferred_name = ctx.name_map.get(dictionary_key(candidate))
                 if preferred_name and preferred_name.isalpha() and preferred_name.isupper():
                     preferred = preferred_name
             if preferred is None:
@@ -1772,18 +2972,38 @@ class SubtitleCleanupTool:
         token: str,
         ctx: DictionaryContext,
     ) -> Optional[str]:
-        lower = token.casefold()
+        lower = dictionary_key(token)
         if lower in ctx.name_map:
             return ctx.name_map[lower]
 
         possessive = re.fullmatch(r"(.+)(['’])[sS]", token)
-        if possessive and possessive.group(1).casefold() in ctx.name_map:
-            return ctx.name_map[possessive.group(1).casefold()] + possessive.group(2) + "s"
+        if possessive and dictionary_key(possessive.group(1)) in ctx.name_map:
+            return ctx.name_map[dictionary_key(possessive.group(1))] + possessive.group(2) + "s"
 
         for suffix in ("ing", "ed", "es", "s"):
             if lower.endswith(suffix) and lower[: -len(suffix)] in ctx.name_map:
                 return ctx.name_map[lower[: -len(suffix)]] + suffix
         return None
+
+    def restore_explicit_acronym_casing(
+        self, line: str, ctx: DictionaryContext
+    ) -> str:
+        """Apply canonical casing from explicit User/Universe acronym lists."""
+        explicit = ctx.explicit_acronyms
+        if not explicit:
+            return line
+
+        def restore(text: str) -> str:
+            def replace(match: re.Match) -> str:
+                token = match.group(0)
+                if token.casefold() == "us":
+                    return token
+                preferred = preferred_acronym_casing(token, explicit)
+                return preferred if preferred is not None else token
+
+            return WORD_RE.sub(replace, text)
+
+        return self.transform_visible_text(line, restore)
 
     def restore_multiword_name_casing(
         self,
@@ -2254,10 +3474,17 @@ class SubtitleCleanupTool:
         # Recovery uses the options captured when the session began. Restore the
         # currently configured options when this run returns to the main menu.
         configured_options = dict(self.options)
+        self._capitalization_choice_remembered = False
         try:
             self._run_spellcheck(use_universe)
         finally:
+            remembered = bool(
+                getattr(self, "_capitalization_choice_remembered", False)
+            )
+            selected = self.options.get("capitalization_mode")
             self.options = configured_options
+            if remembered:
+                self.options["capitalization_mode"] = selected
 
     def _run_spellcheck(self, use_universe: bool) -> None:
         state = self.load_session_state()
@@ -2283,6 +3510,8 @@ class SubtitleCleanupTool:
             start_file = recovered["start_file"]
             start_index = recovered["start_index"]
         else:
+            if not self.require_capitalization_mode_cli():
+                return
             action_label = (
                 "Spellcheck with optional universe dictionary and formatting correction"
                 if use_universe
@@ -2531,7 +3760,13 @@ class SubtitleCleanupTool:
         }
 
     def apply_saved_options(self, state: dict) -> None:
-        snapshot = state.get("options_snapshot", {})
+        self.apply_options_snapshot(state.get("options_snapshot", {}))
+        recursive = state.get("recursive")
+        if isinstance(recursive, bool):
+            self.options["scan_folders_recursively"] = recursive
+
+    def apply_options_snapshot(self, snapshot: object) -> None:
+        """Apply a validated scan snapshot without persisting temporary choices."""
         if isinstance(snapshot, dict):
             for key, default in DEFAULT_OPTIONS.items():
                 value = snapshot.get(key)
@@ -2539,9 +3774,12 @@ class SubtitleCleanupTool:
                     self.options[key] = value
                 elif isinstance(default, int) and not isinstance(value, bool) and isinstance(value, int) and value > 0:
                     self.options[key] = value
-        recursive = state.get("recursive")
-        if isinstance(recursive, bool):
-            self.options["scan_folders_recursively"] = recursive
+                elif (
+                    key == "capitalization_mode"
+                    and isinstance(value, str)
+                    and value in CAPITALIZATION_SCAN_MODES
+                ):
+                    self.options[key] = value
 
     def sync_session_choices(self, session_state: dict) -> None:
         session_state["session_ignore_words"] = sorted(self.current_session_ignores)
@@ -2729,12 +3967,12 @@ class SubtitleCleanupTool:
         covered = set()
         phrase_tokens = []
         for phrase in ctx.phrase_map.values():
-            values = [match.group(0).casefold() for match in WORD_RE.finditer(phrase)]
+            values = [dictionary_key(match.group(0)) for match in WORD_RE.finditer(phrase)]
             if len(values) >= 2:
                 phrase_tokens.append(values)
         phrase_tokens.sort(key=len, reverse=True)
 
-        token_values = [token["word"].casefold() for token in tokens]
+        token_values = [dictionary_key(token["word"]) for token in tokens]
         for values in phrase_tokens:
             width = len(values)
             for start in range(0, len(tokens) - width + 1):
@@ -2747,7 +3985,17 @@ class SubtitleCleanupTool:
                     covered.update(range(start, start + width))
         return covered
 
-    def find_first_unknown_word(self, block: SubtitleBlock, ctx: DictionaryContext, rel_file: str, block_index: int) -> Optional[dict]:
+    def find_first_unknown_word(
+        self,
+        block: SubtitleBlock,
+        ctx: DictionaryContext,
+        rel_file: str,
+        block_index: int,
+        *,
+        exact_occurrence_ignores: Optional[set] = None,
+        block_ignores: Optional[set] = None,
+        session_ignores: Optional[set] = None,
+    ) -> Optional[dict]:
         visible_lines = [strip_html_tags(line) for line in block.text_lines]
         visible_text = "\n".join(visible_lines)
         tokens = []
@@ -2765,14 +4013,30 @@ class SubtitleCleanupTool:
             offset += len(text) + 1
 
         phrase_covered = self.phrase_covered_token_indexes(visible_text, tokens, ctx)
+        active_block_ignores = self.block_ignores if block_ignores is None else block_ignores
+        active_session_ignores = (
+            self.current_session_ignores
+            if session_ignores is None
+            else session_ignores
+        )
         for token_index, token in enumerate(tokens):
             word = token["word"]
             lower = word.casefold()
-            if (rel_file, block_index, lower) in self.block_ignores:
+            occurrence_key = (
+                rel_file,
+                block_index,
+                token["line_index"],
+                token["start"],
+                token["end"],
+                lower,
+            )
+            if exact_occurrence_ignores and occurrence_key in exact_occurrence_ignores:
+                continue
+            if (rel_file, block_index, lower) in active_block_ignores:
                 continue
             if token_index in phrase_covered:
                 continue
-            if ctx.is_known_word(word, self.current_session_ignores):
+            if ctx.is_known_word(word, active_session_ignores):
                 continue
             return {
                 "word": word,
@@ -2781,6 +4045,899 @@ class SubtitleCleanupTool:
                 "end": token["end"],
             }
         return None
+
+    def start_spellcheck_review(
+        self,
+        files: Sequence[Path],
+        target: Path,
+        ctx: DictionaryContext,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+    ) -> SpellcheckReviewSession:
+        """Create a write-free review session and locate its first issue."""
+        session = self.create_spellcheck_review(files, target, ctx)
+        self.resume_spellcheck_review(
+            session, progress_callback=progress_callback
+        )
+        return session
+
+    def review_changed_files(
+        self, session: SpellcheckReviewSession
+    ) -> Tuple[Path, ...]:
+        """Return prepared files whose encoded contents differ from their baseline."""
+        changed = []
+        for file_index in sorted(session.prepared_blocks):
+            if file_index not in session.source_bytes:
+                raise RuntimeError("A prepared subtitle is missing its source baseline.")
+            path = session.files[file_index]
+            rendered = self.encode_srt(path, session.prepared_blocks[file_index])
+            if rendered != session.source_bytes[file_index]:
+                changed.append(path)
+        return tuple(changed)
+
+    def review_has_changes(self, session: Optional[SpellcheckReviewSession]) -> bool:
+        """Report whether a GUI review contains text that has not been saved."""
+        return bool(session is not None and self.review_changed_files(session))
+
+    def commit_spellcheck_review(
+        self,
+        session: SpellcheckReviewSession,
+        *,
+        create_backups: bool,
+    ) -> SpellcheckReviewCommitResult:
+        """Atomically commit prepared review text after drift and backup checks."""
+        changed_files = self.review_changed_files(session)
+        if not changed_files:
+            return SpellcheckReviewCommitResult()
+
+        target = session.target.resolve()
+        changed_payloads = []
+        for path in changed_files:
+            try:
+                file_index = session.files.index(path)
+            except ValueError as error:
+                raise RuntimeError("A changed subtitle is not part of this review.") from error
+            try:
+                path.resolve().relative_to(target)
+            except ValueError as error:
+                raise RuntimeError(
+                    f"Refusing to save a subtitle outside the review folder: {path}"
+                ) from error
+            baseline = session.source_bytes[file_index]
+            try:
+                current = path.read_bytes()
+            except OSError as error:
+                raise RuntimeError(f"Could not re-read {path.name} before saving: {error}") from error
+            if current != baseline:
+                raise RuntimeError(
+                    f"{path.name} changed outside this review; no subtitle files were saved."
+                )
+            changed_payloads.append((file_index, path, baseline, self.encode_srt(
+                path, session.prepared_blocks[file_index]
+            )))
+
+        backup_archives = []
+        if create_backups:
+            groups = self.backup_groups(session.target, session.files)
+            for backup_root in sorted(groups, key=lambda value: str(value).casefold()):
+                try:
+                    backup_path, _created = self.create_backup_archive(
+                        backup_root, groups[backup_root]
+                    )
+                except (OSError, zipfile.BadZipFile) as error:
+                    raise RuntimeError(
+                        f"Could not create {backup_root / 'backup_subtitles.zip'}; "
+                        "no subtitle files were saved."
+                    ) from error
+                backup_archives.append(backup_path)
+
+        written = []
+        try:
+            for payload in changed_payloads:
+                _file_index, path, _baseline, rendered = payload
+                self.atomic_write_bytes(path, rendered)
+                written.append(payload)
+        except Exception as write_error:
+            rollback_errors = []
+            for _file_index, path, baseline, _rendered in reversed(written):
+                try:
+                    self.atomic_write_bytes(path, baseline)
+                except Exception as rollback_error:  # pragma: no cover - catastrophic disk failure
+                    rollback_errors.append(f"{path.name}: {rollback_error}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "Saving failed and one or more earlier files could not be restored: "
+                    + "; ".join(rollback_errors)
+                ) from write_error
+            raise
+
+        for file_index, _path, _baseline, rendered in changed_payloads:
+            session.source_bytes[file_index] = rendered
+        session.undo_actions.clear()
+        return SpellcheckReviewCommitResult(
+            changed_files=changed_files,
+            backup_archives=tuple(backup_archives),
+        )
+
+    def create_spellcheck_review(
+        self,
+        files: Sequence[Path],
+        target: Path,
+        ctx: DictionaryContext,
+    ) -> SpellcheckReviewSession:
+        """Create an unstarted review session for background interfaces."""
+        return SpellcheckReviewSession(
+            files=tuple(Path(path) for path in files),
+            target=Path(target),
+            context=ctx,
+            options_snapshot=self.options_snapshot(),
+        )
+
+    def create_formatting_review(
+        self,
+        files: Sequence[Path],
+        target: Path,
+        ctx: DictionaryContext,
+    ) -> SpellcheckReviewSession:
+        """Create an unstarted write-free formatting review for the GUI."""
+        return SpellcheckReviewSession(
+            files=tuple(Path(path) for path in files),
+            target=Path(target),
+            context=ctx,
+            options_snapshot=self.options_snapshot(),
+            mode="formatting",
+        )
+
+    def resume_formatting_review(
+        self,
+        session: SpellcheckReviewSession,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> SpellcheckReviewSession:
+        """Format every cue in memory, retaining an exact resumable cursor."""
+        if session.mode != "formatting":
+            raise ValueError("This review is not a Formatting-only review.")
+        total_files = len(session.files)
+        while session.file_index < total_files:
+            file_index = session.file_index
+            path = session.files[file_index]
+            blocks = session.prepared_blocks.get(file_index)
+            if blocks is None:
+                source = path.read_bytes()
+                session.source_bytes[file_index] = source
+                blocks = self.parse_srt(path, source)
+                session.prepared_blocks[file_index] = blocks
+            total_subtitles = len(blocks)
+            while session.subtitle_index < total_subtitles:
+                if pause_requested is not None and pause_requested():
+                    session.current_issue = None
+                    raise SpellcheckReviewPaused()
+                block_index = session.subtitle_index
+                if progress_callback is not None:
+                    progress_callback(
+                        "Formatting",
+                        file_index + 1,
+                        total_files,
+                        block_index + 1,
+                        total_subtitles,
+                    )
+                block = blocks[block_index]
+                block.text_lines = self.format_text_lines(
+                    block.text_lines, session.context
+                )
+                session.subtitle_index += 1
+            self.collect_file_validation_findings(
+                path,
+                session.target,
+                blocks,
+                findings=session.validation_findings,
+            )
+            session.file_index += 1
+            session.subtitle_index = 0
+        session.current_issue = None
+        return session
+
+    def resume_spellcheck_review(
+        self,
+        session: SpellcheckReviewSession,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Continue a paused write-free review session."""
+        session.current_issue = None
+        return self._advance_spellcheck_review(
+            session,
+            progress_callback=progress_callback,
+            pause_requested=pause_requested,
+        )
+
+    def ignore_review_occurrence(
+        self,
+        session: SpellcheckReviewSession,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Ignore only the selected token position and advance in memory."""
+        issue = session.current_issue
+        if issue is None:
+            return None
+        session.ignored_occurrences.add((
+            issue.relative_file,
+            issue.subtitle_index,
+            issue.line_index,
+            issue.start,
+            issue.end,
+            issue.word.casefold(),
+        ))
+        session.undo_actions.append(SpellcheckReviewUndoAction("occurrence", issue))
+        session.current_issue = None
+        return self._advance_spellcheck_review(
+            session,
+            progress_callback=progress_callback,
+            pause_requested=pause_requested,
+        )
+
+    def ignore_review_word_for_session(
+        self,
+        session: SpellcheckReviewSession,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Ignore every case-insensitive occurrence for this review only."""
+        issue = session.current_issue
+        if issue is None:
+            return None
+        session.ignored_words.add(issue.word.casefold())
+        session.undo_actions.append(SpellcheckReviewUndoAction("session", issue))
+        session.current_issue = None
+        return self._advance_spellcheck_review(
+            session,
+            progress_callback=progress_callback,
+            pause_requested=pause_requested,
+        )
+
+    def replace_review_occurrence(
+        self,
+        session: SpellcheckReviewSession,
+        replacement: str,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Replace exactly the selected visible token in memory and advance."""
+        return self.replace_review_with_scope(
+            session,
+            replacement,
+            "occurrence",
+            progress_callback=progress_callback,
+            pause_requested=pause_requested,
+        )
+
+    def replace_review_with_scope(
+        self,
+        session: SpellcheckReviewSession,
+        replacement: str,
+        scope: str,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Replace the selected token and optionally retain a substitution rule."""
+        issue = session.current_issue
+        if issue is None:
+            return None
+        replacement = replacement.strip()
+        if not replacement:
+            raise ValueError("A replacement cannot be empty.")
+        if scope not in {"occurrence", "session", "universe", "always"}:
+            raise ValueError("Choose This time, This session, This universe, or Always.")
+        if scope == "universe" and not session.context.universe:
+            raise ValueError("No Universe Dictionary is active for this review.")
+        if scope in {"universe", "always"} and not session.context.is_known_word(
+            replacement, session.ignored_words
+        ):
+            raise ValueError(
+                "A persistent replacement must already be present in the selected "
+                "dictionary context. Add the replacement word first."
+            )
+        blocks = session.prepared_blocks.get(issue.file_number - 1)
+        if blocks is None or not 0 <= issue.subtitle_index < len(blocks):
+            raise RuntimeError("The selected subtitle is no longer available.")
+        block = blocks[issue.subtitle_index]
+        if not 0 <= issue.line_index < len(block.text_lines):
+            raise RuntimeError("The selected subtitle line is no longer available.")
+        line = block.text_lines[issue.line_index]
+        visible_line = strip_html_tags(line)
+        if visible_line[issue.start:issue.end].casefold() != issue.word.casefold():
+            raise RuntimeError("The selected word has changed since it was displayed.")
+        before_text_lines = tuple(block.text_lines)
+        key = issue.word.casefold()
+        effect = None
+        if scope == "session":
+            effect = {
+                "scope": scope,
+                "input": issue.word,
+                "output": replacement,
+                "previous_exists": key in session.substitutions,
+                "previous_value": session.substitutions.get(key),
+                "review_previous_exists": key in session.substitutions,
+                "review_previous_value": session.substitutions.get(key),
+                "propagated_changes": [],
+            }
+            session.substitutions[key] = replacement
+            self.log_event({
+                "type": "session_substitution",
+                "from": issue.word,
+                "to": replacement,
+            })
+        elif scope in {"universe", "always"}:
+            context = session.context
+            target = "universe" if scope == "universe" else "user"
+            target_map = (
+                context.universe_substitutions
+                if target == "universe"
+                else context.user_substitutions
+            )
+            effect = {
+                "scope": scope,
+                "target": target,
+                "universe": context.universe if target == "universe" else None,
+                "language": context.language,
+                "input": issue.word,
+                "output": replacement,
+                "previous_exists": key in target_map,
+                "previous_value": target_map.get(key),
+                "review_previous_exists": key in session.substitutions,
+                "review_previous_value": session.substitutions.get(key),
+                "propagated_changes": [],
+            }
+            path = (
+                self.universe_dir / context.universe / "substitutions.tsv"
+                if target == "universe"
+                else self.user_dir / f"{context.language}_substitutions.tsv"
+            )
+            event = {
+                "type": "substitution_add",
+                "target": target,
+                "input": issue.word,
+                "output": replacement,
+            }
+            if target == "universe":
+                event["universe"] = context.universe
+            else:
+                event["base_language"] = context.language
+            self.add_substitution_to_file(path, issue.word, replacement, event)
+            target_map[key] = replacement
+            context.substitutions[key] = replacement
+            session.substitutions[key] = replacement
+        block.text_lines[issue.line_index] = replace_visible_span(
+            line,
+            issue.start,
+            issue.end,
+            replacement,
+        )
+        session.undo_actions.append(SpellcheckReviewUndoAction(
+            "replacement",
+            issue,
+            before_text_lines,
+            replacement_effect=effect,
+        ))
+        self.log_event({
+            "type": "replace_word",
+            "scope": {"occurrence": 1, "session": 2, "universe": 3, "always": 4}[scope],
+            "file": issue.relative_file,
+            "subtitle_index": issue.subtitle_index,
+            "from": issue.word,
+            "to": replacement,
+        })
+        session.current_issue = None
+        return self._advance_spellcheck_review(
+            session,
+            progress_callback=progress_callback,
+            pause_requested=pause_requested,
+        )
+
+    def replace_review_cue_text(
+        self,
+        session: SpellcheckReviewSession,
+        edited_text: str,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Replace the current cue's dialogue in memory without touching metadata."""
+        issue = session.current_issue
+        if issue is None:
+            return None
+        blocks = session.prepared_blocks.get(issue.file_number - 1)
+        if blocks is None or not 0 <= issue.subtitle_index < len(blocks):
+            raise RuntimeError("The selected subtitle is no longer available.")
+        normalized = edited_text.replace("\r\n", "\n").replace("\r", "\n")
+        edited_lines = normalized.split("\n")
+        if not normalized.strip():
+            raise ValueError("Subtitle dialogue cannot be empty.")
+        if any(not line.strip() for line in edited_lines):
+            raise ValueError("Subtitle dialogue cannot contain a blank line.")
+        block = blocks[issue.subtitle_index]
+        before_text_lines = tuple(block.text_lines)
+        if tuple(edited_lines) == before_text_lines:
+            return issue
+        block.text_lines = edited_lines
+        session.undo_actions.append(SpellcheckReviewUndoAction(
+            "cue_edit",
+            issue,
+            before_text_lines,
+        ))
+        session.current_issue = None
+        return self._advance_spellcheck_review(
+            session,
+            progress_callback=progress_callback,
+            pause_requested=pause_requested,
+        )
+
+    def add_review_dictionary_entry(
+        self,
+        session: SpellcheckReviewSession,
+        entry: str,
+        *,
+        list_name: str,
+        target: str,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Persist one GUI word/name/acronym entry and advance the review."""
+        issue = session.current_issue
+        if issue is None:
+            return None
+        if list_name not in {"words", "names", "acronyms"}:
+            raise ValueError("Choose an accepted word/phrase, name, or acronym.")
+        if target not in {"user", "universe"}:
+            raise ValueError("Choose either the User or Universe Dictionary.")
+        if target == "universe" and not session.context.universe:
+            raise ValueError("No Universe Dictionary is active for this review.")
+
+        preferred = " ".join(entry.split())
+        if not preferred:
+            raise ValueError("Dictionary entry text cannot be empty.")
+        entry_tokens = [match.group(0) for match in WORD_RE.finditer(preferred)]
+        if not entry_tokens or issue.word.casefold() not in {
+            token.casefold() for token in entry_tokens
+        }:
+            raise ValueError(
+                f'The entry must include the selected word "{issue.word}".'
+            )
+        if list_name == "acronyms":
+            preferred = self.validate_acronym_entry(preferred)
+            entry_tokens = [preferred]
+
+        blocks = session.prepared_blocks.get(issue.file_number - 1)
+        if blocks is None or not 0 <= issue.subtitle_index < len(blocks):
+            raise RuntimeError("The selected subtitle is no longer available.")
+        block = blocks[issue.subtitle_index]
+        if len(entry_tokens) == 1:
+            if WORD_RE.fullmatch(preferred) is None:
+                raise ValueError("A single-word entry cannot include punctuation or spaces.")
+            if dictionary_key(preferred) != dictionary_key(issue.word):
+                raise ValueError(
+                    "A single-word dictionary entry may change casing only; use "
+                    "Edit/Substitute to change its spelling."
+                )
+        elif not self.phrase_present_in_block(preferred, block):
+            raise ValueError("That complete phrase was not found in the current subtitle.")
+        if list_name == "names" and len(entry_tokens) == 1:
+            if not 0 <= issue.line_index < len(block.text_lines):
+                raise RuntimeError("The selected subtitle line is no longer available.")
+            visible_line = strip_html_tags(block.text_lines[issue.line_index])
+            if dictionary_key(visible_line[issue.start:issue.end]) != dictionary_key(issue.word):
+                raise RuntimeError("The selected word has changed since it was displayed.")
+
+        context = session.context
+        filename = f"{list_name}.txt"
+        if target == "universe":
+            path = self.universe_dir / context.universe / filename
+            event = {
+                "type": "dictionary_add",
+                "target": "universe",
+                "universe": context.universe,
+                "list": list_name,
+                "word": preferred,
+            }
+            target_words = context.universe_words
+            target_names = context.universe_names
+            target_acronyms = context.universe_acronyms
+        else:
+            path = self.user_dir / f"{context.language}_{filename}"
+            event = {
+                "type": "dictionary_add",
+                "target": "user",
+                "base_language": context.language,
+                "list": list_name,
+                "word": preferred,
+            }
+            target_words = context.user_words
+            target_names = context.user_names
+            target_acronyms = context.user_acronyms
+
+        if not self.add_word_to_file(path, preferred, event):
+            raise ValueError("That entry is already present in the selected dictionary.")
+
+        before_text_lines = tuple(block.text_lines)
+        if list_name in {"names", "acronyms"}:
+            if list_name == "acronyms":
+                target_acronyms.add(preferred)
+                context.acronym_set.add(preferred)
+            else:
+                target_names[dictionary_key(preferred)] = preferred
+            if len(entry_tokens) > 1:
+                block.text_lines = self.restore_multiword_name_casing_in_lines(
+                    block.text_lines, context
+                )
+            else:
+                line = block.text_lines[issue.line_index]
+                block.text_lines[issue.line_index] = replace_visible_span(
+                    line, issue.start, issue.end, preferred
+                )
+        else:
+            target_words.add(dictionary_key(preferred))
+
+        session.undo_actions.append(SpellcheckReviewUndoAction(
+            "dictionary_add",
+            issue,
+            before_text_lines,
+            event,
+        ))
+        session.current_issue = None
+        try:
+            return self._advance_spellcheck_review(
+                session,
+                progress_callback=progress_callback,
+                pause_requested=pause_requested,
+            )
+        except SpellcheckReviewPaused:
+            raise
+        except Exception:
+            session.undo_actions.pop()
+            block.text_lines = list(before_text_lines)
+            self.remove_logged_dictionary_add(event)
+            self.remove_dictionary_entry_from_context(event, context)
+            self.log_event({
+                "type": "undo",
+                "undo_type": "dictionary_add",
+                "target": event.get("target"),
+                "universe": event.get("universe"),
+                "base_language": event.get("base_language"),
+                "list": event.get("list"),
+                "word": event.get("word"),
+            })
+            session.file_index = issue.file_number - 1
+            session.subtitle_index = issue.subtitle_index
+            session.current_issue = issue
+            raise
+
+    def undo_review_action(
+        self,
+        session: SpellcheckReviewSession,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Undo the latest GUI review action and return to its occurrence."""
+        if not session.undo_actions:
+            return session.current_issue
+        action = session.undo_actions[-1]
+        issue = action.issue
+        if action.kind == "replacement" and action.replacement_effect:
+            effect = action.replacement_effect
+            scope = effect.get("scope")
+            key = str(effect.get("input", "")).casefold()
+            if scope in {"universe", "always"}:
+                self.undo_persistent_substitution(effect, session.context)
+                if effect.get("previous_exists"):
+                    undo_event = {
+                        "type": "substitution_edit",
+                        "target": effect.get("target"),
+                        "from_input": effect.get("input"),
+                        "input": effect.get("input"),
+                        "output": effect.get("previous_value"),
+                    }
+                else:
+                    undo_event = {
+                        "type": "substitution_remove",
+                        "target": effect.get("target"),
+                        "input": effect.get("input"),
+                    }
+                if effect.get("target") == "universe":
+                    undo_event["universe"] = effect.get("universe")
+                else:
+                    undo_event["base_language"] = effect.get("language")
+                self.log_event(undo_event)
+            if effect.get("review_previous_exists", effect.get("previous_exists")):
+                session.substitutions[key] = effect.get(
+                    "review_previous_value", effect.get("previous_value")
+                )
+            else:
+                session.substitutions.pop(key, None)
+        session.undo_actions.pop()
+        if action.kind == "occurrence":
+            session.ignored_occurrences.discard((
+                issue.relative_file,
+                issue.subtitle_index,
+                issue.line_index,
+                issue.start,
+                issue.end,
+                issue.word.casefold(),
+            ))
+        elif action.kind == "session":
+            session.ignored_words.discard(issue.word.casefold())
+        elif action.kind in {"replacement", "cue_edit"}:
+            blocks = session.prepared_blocks.get(issue.file_number - 1)
+            if blocks is None or not 0 <= issue.subtitle_index < len(blocks):
+                raise RuntimeError("The edited subtitle is no longer available.")
+            if action.kind == "replacement" and action.replacement_effect:
+                for change in reversed(
+                    action.replacement_effect.get("propagated_changes", [])
+                ):
+                    changed_blocks = session.prepared_blocks.get(
+                        int(change.get("file_index", -1))
+                    )
+                    changed_index = int(change.get("subtitle_index", -1))
+                    if changed_blocks is None or not 0 <= changed_index < len(changed_blocks):
+                        raise RuntimeError("A propagated subtitle edit is no longer available.")
+                    changed_blocks[changed_index].text_lines = list(
+                        change.get("before_text_lines", ())
+                    )
+            blocks[issue.subtitle_index].text_lines = list(action.before_text_lines)
+        elif action.kind == "dictionary_add":
+            effect = action.dictionary_effect
+            if effect is None:
+                raise RuntimeError("The dictionary addition cannot be identified for Undo.")
+            blocks = session.prepared_blocks.get(issue.file_number - 1)
+            if blocks is None or not 0 <= issue.subtitle_index < len(blocks):
+                raise RuntimeError("The edited subtitle is no longer available.")
+            blocks[issue.subtitle_index].text_lines = list(action.before_text_lines)
+            self.remove_logged_dictionary_add(effect)
+            self.remove_dictionary_entry_from_context(effect, session.context)
+            self.log_event({
+                "type": "undo",
+                "undo_type": "dictionary_add",
+                "target": effect.get("target"),
+                "universe": effect.get("universe"),
+                "base_language": effect.get("base_language"),
+                "list": effect.get("list"),
+                "word": effect.get("word"),
+            })
+        session.file_index = issue.file_number - 1
+        session.subtitle_index = issue.subtitle_index
+        session.current_issue = None
+        return self._advance_spellcheck_review(
+            session,
+            progress_callback=progress_callback,
+            pause_requested=pause_requested,
+        )
+
+    def undo_review_ignore(
+        self,
+        session: SpellcheckReviewSession,
+        **kwargs,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Backward-compatible name for the generalized GUI review undo."""
+        return self.undo_review_action(session, **kwargs)
+
+    @staticmethod
+    def _active_review_replacement_actions(
+        session: SpellcheckReviewSession,
+    ) -> List[SpellcheckReviewUndoAction]:
+        """Return the newest active owner for each GUI-created substitution."""
+        actions = []
+        claimed = set()
+        for action in reversed(session.undo_actions):
+            effect = action.replacement_effect
+            if action.kind != "replacement" or not effect:
+                continue
+            key = str(effect.get("input", "")).casefold()
+            scope = effect.get("scope")
+            if not key or scope == "occurrence" or key in claimed:
+                continue
+            expected = effect.get("output")
+            current = session.substitutions.get(key)
+            if current == expected:
+                actions.append(action)
+                claimed.add(key)
+        actions.reverse()
+        return actions
+
+    def _format_review_text_lines(
+        self,
+        session: SpellcheckReviewSession,
+        text_lines: Sequence[str],
+    ) -> List[str]:
+        """Format lines while deferring substitutions created during this review."""
+        deferred = {}
+        for key in session.substitutions:
+            if key in session.context.substitutions:
+                deferred[key] = session.context.substitutions.pop(key)
+        try:
+            return self.format_text_lines(
+                list(text_lines),
+                session.context,
+                defer_tracked_substitutions=True,
+            )
+        finally:
+            session.context.substitutions.update(deferred)
+
+    def _apply_review_substitutions_to_block(
+        self,
+        session: SpellcheckReviewSession,
+        block: SubtitleBlock,
+        relative_file: str,
+        block_index: int,
+    ) -> None:
+        """Apply GUI-created rules and attach every propagated edit to Undo."""
+        owners = {
+            str((action.replacement_effect or {}).get("input", "")).casefold(): action
+            for action in self._active_review_replacement_actions(session)
+        }
+        for source, replacement in sorted(
+            session.substitutions.items(), key=lambda item: len(item[0]), reverse=True
+        ):
+            action = owners.get(source.casefold())
+            changes = (
+                action.replacement_effect.setdefault("propagated_changes", [])
+                if action is not None and action.replacement_effect is not None
+                else None
+            )
+            if changes is not None and any(
+                value.get("file") == relative_file
+                and value.get("subtitle_index") == block_index
+                for value in changes
+            ):
+                continue
+            before = list(block.text_lines)
+            after = [
+                self.apply_substitutions(line, {source: replacement})
+                for line in before
+            ]
+            if after == before:
+                continue
+            block.text_lines = after
+            if changes is not None:
+                changes.append({
+                    "file": relative_file,
+                    "file_index": session.file_index,
+                    "subtitle_index": block_index,
+                    "before_text_lines": before,
+                    "after_text_lines": after,
+                })
+
+    def _advance_spellcheck_review(
+        self,
+        session: SpellcheckReviewSession,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+        pause_requested: Optional[Callable[[], bool]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        total_files = len(session.files)
+        while session.file_index < total_files:
+            file_index = session.file_index
+            path = session.files[file_index]
+            try:
+                relative_file = str(path.relative_to(session.target))
+            except ValueError:
+                relative_file = path.name
+
+            blocks = session.prepared_blocks.get(file_index)
+            if blocks is None:
+                source_bytes = path.read_bytes()
+                session.source_bytes[file_index] = source_bytes
+                blocks = self.parse_srt(path, source_bytes)
+                session.prepared_blocks[file_index] = blocks
+                total_subtitles = len(blocks)
+                for block_index, block in enumerate(blocks):
+                    if pause_requested is not None and pause_requested():
+                        session.prepared_blocks.pop(file_index, None)
+                        session.source_bytes.pop(file_index, None)
+                        session.current_issue = None
+                        raise SpellcheckReviewPaused()
+                    if progress_callback is not None:
+                        progress_callback(
+                            "Preparing",
+                            file_index + 1,
+                            total_files,
+                            block_index + 1,
+                            total_subtitles,
+                        )
+                    block.text_lines = self._format_review_text_lines(
+                        session, block.text_lines
+                    )
+
+            total_subtitles = len(blocks)
+            while session.subtitle_index < total_subtitles:
+                if pause_requested is not None and pause_requested():
+                    session.current_issue = None
+                    raise SpellcheckReviewPaused()
+                block_index = session.subtitle_index
+                block = blocks[block_index]
+                self._apply_review_substitutions_to_block(
+                    session, block, relative_file, block_index
+                )
+                if progress_callback is not None:
+                    progress_callback(
+                        "Spellchecking",
+                        file_index + 1,
+                        total_files,
+                        block_index + 1,
+                        total_subtitles,
+                    )
+                unknown = self.find_first_unknown_word(
+                    block,
+                    session.context,
+                    relative_file,
+                    block_index,
+                    exact_occurrence_ignores=session.ignored_occurrences,
+                    block_ignores=set(),
+                    session_ignores=session.ignored_words,
+                )
+                if unknown is None:
+                    session.subtitle_index += 1
+                    continue
+                word = unknown["word"]
+                session.current_issue = SpellcheckIssuePreview(
+                    path=path,
+                    relative_file=relative_file,
+                    file_number=file_index + 1,
+                    total_files=total_files,
+                    subtitle_index=block_index,
+                    total_subtitles=total_subtitles,
+                    word=word,
+                    line_index=unknown["line_index"],
+                    start=unknown["start"],
+                    end=unknown["end"],
+                    suggestions=tuple(session.context.suggestions_for(word)),
+                    previous_blocks=tuple(
+                        item.render()
+                        for item in blocks[max(0, block_index - 2):block_index]
+                    ),
+                    current_block=block.render(),
+                    current_text="\n".join(block.text_lines),
+                    timestamp=block.timestamp.strip(),
+                    next_blocks=tuple(
+                        item.render()
+                        for item in blocks[block_index + 1:block_index + 3]
+                    ),
+                )
+                return session.current_issue
+
+            session.file_index += 1
+            session.subtitle_index = 0
+
+        session.current_issue = None
+        return None
+
+    def find_next_spellcheck_issue(
+        self,
+        files: Sequence[Path],
+        target: Path,
+        ctx: DictionaryContext,
+        *,
+        progress_callback: Optional[Callable[[str, int, int, int, int], None]] = None,
+    ) -> Optional[SpellcheckIssuePreview]:
+        """Prepare files in memory and return the first unknown without writing.
+
+        This is the shared boundary used by the GUI preview. It follows the
+        same formatting-before-spellcheck order as ``spellcheck_file`` while
+        deliberately omitting session persistence, backup creation, logging,
+        and disk writes.
+        """
+        return self.start_spellcheck_review(
+            files,
+            target,
+            ctx,
+            progress_callback=progress_callback,
+        ).current_issue
 
     def prompt_spellcheck_action(
         self,
@@ -2825,7 +4982,7 @@ class SubtitleCleanupTool:
             action_lines = [
                 "7 - Edit/Substitute",
                 "8 - Ignore",
-                "9 - Add word/name/phrase",
+                "9 - Add word/name/acronym/phrase",
                 "S - Search this subtitle line in Google",
                 "U - Undo last action",
                 "0 - Quit spellcheck",
@@ -2880,7 +5037,12 @@ class SubtitleCleanupTool:
                     self.log_event({"type": "session_ignore", "word": word})
                 return "continue"
             if action == 9:
-                dictionary_entry = self.prompt_dictionary_entry(word, blocks[block_index])
+                dictionary_entry = self.prompt_dictionary_entry(
+                    word,
+                    blocks[block_index],
+                    ctx,
+                    target="universe" if scope == 3 else "user",
+                )
                 if dictionary_entry is None:
                     continue
                 list_name, preferred = dictionary_entry
@@ -2912,19 +5074,24 @@ class SubtitleCleanupTool:
         self,
         block: SubtitleBlock,
         selected_word: str,
+        *,
+        line_index: Optional[int] = None,
     ) -> bool:
         visible_lines = [strip_html_tags(line).strip() for line in block.text_lines]
-        search_text = next(
-            (
-                line
-                for line in visible_lines
-                if any(
-                    match.group(0).casefold() == selected_word.casefold()
-                    for match in WORD_RE.finditer(line)
-                )
-            ),
-            " ".join(line for line in visible_lines if line),
-        )
+        if line_index is not None and 0 <= line_index < len(visible_lines):
+            search_text = visible_lines[line_index]
+        else:
+            search_text = next(
+                (
+                    line
+                    for line in visible_lines
+                    if any(
+                        match.group(0).casefold() == selected_word.casefold()
+                        for match in WORD_RE.finditer(line)
+                    )
+                ),
+                " ".join(line for line in visible_lines if line),
+            )
         search_text = " ".join(search_text.split())
         if not search_text:
             print("This subtitle line has no searchable text.")
@@ -3043,6 +5210,8 @@ class SubtitleCleanupTool:
         self,
         word: str,
         block: Optional[SubtitleBlock] = None,
+        context: Optional[DictionaryContext] = None,
+        target: Optional[str] = None,
     ) -> Optional[Tuple[str, str]]:
         while True:
             print(f'\nHow should "{word}" be stored?')
@@ -3051,11 +5220,27 @@ class SubtitleCleanupTool:
             if block is not None:
                 print("3 - Accepted exact phrase from this subtitle")
                 print("4 - Exact name phrase with authoritative casing")
+                print("5 - Acronym with authoritative casing")
+            else:
+                print("3 - Acronym with authoritative casing")
             print("0 - Go back")
             choice = input("Dictionary entry type: ").strip()
             if choice == "0":
                 return None
             if choice == "1":
+                if context is not None:
+                    conflicts = (
+                        self.word_acronym_conflicts_for_location(
+                            word,
+                            target,
+                            language=context.language if target == "user" else None,
+                            universe=context.universe if target == "universe" else None,
+                        )
+                        if target in {"user", "universe"}
+                        else self.word_acronym_conflicts(word, context)
+                    )
+                    if not self.confirm_word_acronym_conflict(word, conflicts):
+                        continue
                 return "words", word
             if choice == "2":
                 preferred = input(f'Preferred name casing [{word}]: ').strip() or word
@@ -3065,7 +5250,47 @@ class SubtitleCleanupTool:
                         "when the spelling itself should change."
                     )
                     continue
+                if context is not None:
+                    conflicts = (
+                        self.word_acronym_conflicts_for_location(
+                            preferred,
+                            target,
+                            language=context.language if target == "user" else None,
+                            universe=context.universe if target == "universe" else None,
+                        )
+                        if target in {"user", "universe"}
+                        else self.word_acronym_conflicts(preferred, context)
+                    )
+                    if not self.confirm_word_acronym_conflict(preferred, conflicts):
+                        continue
                 return "names", preferred
+            if choice == ("5" if block is not None else "3"):
+                preferred = input(f'Canonical acronym casing [{word}]: ').strip() or word
+                try:
+                    preferred = self.validate_acronym_entry(preferred)
+                except ValueError as error:
+                    print(error)
+                    continue
+                if preferred.casefold() != word.casefold():
+                    print(
+                        "An acronym entry may change casing only. Use Edit/Substitute "
+                        "when the spelling itself should change."
+                    )
+                    continue
+                if context is not None:
+                    conflicts = (
+                        self.acronym_word_conflicts_for_location(
+                            preferred,
+                            target,
+                            language=context.language if target == "user" else None,
+                            universe=context.universe if target == "universe" else None,
+                        )
+                        if target in {"user", "universe"}
+                        else self.acronym_word_conflicts(preferred, context)
+                    )
+                    if not self.confirm_acronym_word_conflict(preferred, conflicts):
+                        continue
+                return "acronyms", preferred
             if choice in {"3", "4"} and block is not None:
                 phrase = input("Exact phrase from this subtitle: ").strip()
                 phrase_words = [match.group(0).casefold() for match in WORD_RE.finditer(phrase)]
@@ -3085,7 +5310,7 @@ class SubtitleCleanupTool:
                     )
                     continue
                 return "names", preferred
-            valid = "1, 2, 3, 4, or 0" if block is not None else "1, 2, or 0"
+            valid = "1, 2, 3, 4, 5, or 0" if block is not None else "1, 2, 3, or 0"
             print(f"Please choose {valid}.")
 
     def valid_action_scope(self, action: int, scope: int, ctx: DictionaryContext) -> bool:
@@ -3233,7 +5458,9 @@ class SubtitleCleanupTool:
             else:
                 return False, None
 
-        dictionary_entry = self.prompt_dictionary_entry(replacement)
+        dictionary_entry = self.prompt_dictionary_entry(
+            replacement, context=ctx, target=target
+        )
         if dictionary_entry is None:
             return False, None
         list_name, preferred = dictionary_entry
@@ -3249,6 +5476,7 @@ class SubtitleCleanupTool:
             }
             target_words = ctx.universe_words
             target_names = ctx.universe_names
+            target_acronyms = ctx.universe_acronyms
         else:
             path = self.user_dir / f"{ctx.language}_{filename}"
             event = {
@@ -3260,12 +5488,16 @@ class SubtitleCleanupTool:
             }
             target_words = ctx.user_words
             target_names = ctx.user_names
+            target_acronyms = ctx.user_acronyms
 
         dictionary_add_action = event if self.add_word_to_file(path, preferred, event) else None
         if list_name == "names":
-            target_names[preferred.casefold()] = preferred
+            target_names[dictionary_key(preferred)] = preferred
+        elif list_name == "acronyms":
+            target_acronyms.add(preferred)
+            ctx.acronym_set.add(preferred)
         else:
-            target_words.add(preferred.casefold())
+            target_words.add(dictionary_key(preferred))
         return True, dictionary_add_action
 
     def apply_dictionary_add(
@@ -3275,8 +5507,10 @@ class SubtitleCleanupTool:
         ctx: DictionaryContext,
         list_name: str = "words",
     ) -> Optional[dict]:
-        if list_name not in {"words", "names"}:
+        if list_name not in {"words", "names", "acronyms"}:
             raise ValueError(f"Unsupported dictionary list: {list_name}")
+        if list_name == "acronyms":
+            word = self.validate_acronym_entry(word)
         filename = f"{list_name}.txt"
         if scope == 3 and ctx.universe:
             path = self.universe_dir / ctx.universe / filename
@@ -3290,9 +5524,12 @@ class SubtitleCleanupTool:
             if not self.add_word_to_file(path, word, event):
                 return None
             if list_name == "names":
-                ctx.universe_names[word.casefold()] = word
+                ctx.universe_names[dictionary_key(word)] = word
+            elif list_name == "acronyms":
+                ctx.universe_acronyms.add(word)
+                ctx.acronym_set.add(word)
             else:
-                ctx.universe_words.add(word.casefold())
+                ctx.universe_words.add(dictionary_key(word))
             self.undo_stack.append(event)
             return event
         elif scope == 4:
@@ -3307,9 +5544,12 @@ class SubtitleCleanupTool:
             if not self.add_word_to_file(path, word, event):
                 return None
             if list_name == "names":
-                ctx.user_names[word.casefold()] = word
+                ctx.user_names[dictionary_key(word)] = word
+            elif list_name == "acronyms":
+                ctx.user_acronyms.add(word)
+                ctx.acronym_set.add(word)
             else:
-                ctx.user_words.add(word.casefold())
+                ctx.user_words.add(dictionary_key(word))
             self.undo_stack.append(event)
             return event
         return None
@@ -3397,11 +5637,19 @@ class SubtitleCleanupTool:
     ) -> None:
         if ctx is None:
             return
-        key = action.get("word", "").casefold()
+        key = dictionary_key(action.get("word", ""))
         is_user = action.get("target") == "user"
         if action.get("list") == "names":
             names = ctx.user_names if is_user else ctx.universe_names
             names.pop(key, None)
+        elif action.get("list") == "acronyms":
+            acronyms = ctx.user_acronyms if is_user else ctx.universe_acronyms
+            for value in list(acronyms):
+                if value.casefold() == key:
+                    acronyms.discard(value)
+            ctx.acronym_set = set(COMMON_ACRONYMS)
+            ctx.acronym_set.update(ctx.explicit_acronyms)
+            ctx.acronym_set.update(self.derive_acronyms(ctx))
         else:
             words = ctx.user_words if is_user else ctx.universe_words
             words.discard(key)
@@ -3590,9 +5838,15 @@ class SubtitleCleanupTool:
             target_map = ctx.user_substitutions if target == "user" else ctx.universe_substitutions
             if effect.get("previous_exists"):
                 target_map[key] = effect.get("previous_value")
-                ctx.substitutions[key] = effect.get("previous_value")
             else:
                 target_map.pop(key, None)
+            # Universe substitutions override User substitutions. Rebuild the
+            # effective value so undoing one layer cannot hide the other.
+            if key in ctx.universe_substitutions:
+                ctx.substitutions[key] = ctx.universe_substitutions[key]
+            elif key in ctx.user_substitutions:
+                ctx.substitutions[key] = ctx.user_substitutions[key]
+            else:
                 ctx.substitutions.pop(key, None)
 
     def remove_logged_dictionary_add(self, action: dict) -> None:
@@ -3641,7 +5895,9 @@ class SubtitleCleanupTool:
     ) -> Optional[dict]:
         if not isinstance(word, str) or not word.strip():
             return None
-        normalized_list = "names" if list_name == "names" else "words"
+        normalized_list = (
+            list_name if list_name in {"words", "names", "acronyms"} else "words"
+        )
         if target == "user":
             result = {
                 "type": "dictionary_add",
@@ -3687,7 +5943,9 @@ class SubtitleCleanupTool:
         if not isinstance(word, str):
             return []
         word_key = word.casefold()
-        normalized_list = list_name if list_name in {"words", "names"} else None
+        normalized_list = (
+            list_name if list_name in {"words", "names", "acronyms"} else None
+        )
         removed = []
         for key, entry in list(active.items()):
             if entry.get("target") != target:
@@ -3973,6 +6231,7 @@ class SubtitleCleanupTool:
         results: Dict[tuple, dict] = {}
         word_cache: Dict[Path, set] = {}
         name_cache: Dict[Path, Dict[str, str]] = {}
+        acronym_cache: Dict[Path, Dict[str, str]] = {}
         for candidate in candidates:
             word_key = candidate["word"].casefold()
             for path in self.dictionary_paths_for_event(candidate):
@@ -3984,6 +6243,16 @@ class SubtitleCleanupTool:
                     if word_key not in names:
                         continue
                     current["word"] = names[word_key]
+                elif candidate["list"] == "acronyms":
+                    if path not in acronym_cache:
+                        acronym_cache[path] = {
+                            value.casefold(): value
+                            for value in self.load_acronym_set(path)
+                        }
+                    acronyms = acronym_cache[path]
+                    if word_key not in acronyms:
+                        continue
+                    current["word"] = acronyms[word_key]
                 else:
                     if path not in word_cache:
                         word_cache[path] = self.load_word_set(path)
@@ -4021,7 +6290,11 @@ class SubtitleCleanupTool:
     def recent_location_label(self, event: dict) -> str:
         if event.get("target") == "user":
             language = event.get("base_language")
-            return f"User ({str(language).title()})" if language else "User Dictionary"
+            labels = {
+                "american": "American English",
+                "british": "British English",
+            }
+            return f"User ({labels.get(language, str(language).title())})" if language else "User Dictionary"
         return str(event.get("universe") or "Universe")
 
     def review_recent_dictionary_additions(self) -> None:
@@ -4037,7 +6310,10 @@ class SubtitleCleanupTool:
             for i, event in enumerate(entries, start=1):
                 label = self.recent_location_label(event)
                 label = truncate_display(label, int(self.options["maximum_universe_display_name_length"]))
-                entry_type = "Name" if event.get("list") == "names" else "Word"
+                entry_type = {
+                    "names": "Name",
+                    "acronyms": "Acronym",
+                }.get(event.get("list"), "Word")
                 print(f"{i:<7} {label:<24} {entry_type:<7} {event.get('word', '')}")
             choice = input("\nEnter 0 to go back, or an index number to edit: ").strip()
             if choice == "0":
@@ -4070,9 +6346,14 @@ class SubtitleCleanupTool:
             if choice == "1":
                 new_word = input("New word: ").strip()
                 if new_word:
-                    self.modify_dictionary_word(event, new_word)
-                    event["word"] = new_word
-                    pause("Word modified. Press Enter to continue.")
+                    try:
+                        changed = self.modify_dictionary_word(event, new_word)
+                    except ValueError as error:
+                        pause(f"{error} Press Enter to continue.")
+                        continue
+                    if changed:
+                        event["word"] = new_word
+                        pause("Word modified. Press Enter to continue.")
             elif target == "user" and choice == "2":
                 universe = self.choose_universe()
                 if universe and self.confirm_move(word, universe):
@@ -4101,8 +6382,35 @@ class SubtitleCleanupTool:
         print("2. No, go back")
         return input("\nChoice: ").strip() == "1"
 
-    def modify_dictionary_word(self, event: dict, new_word: str) -> None:
+    def modify_dictionary_word(self, event: dict, new_word: str) -> bool:
         old_word = event.get("word", "")
+        list_name = self.dictionary_list_name(event)
+        target = event.get("target")
+        language = event.get("base_language")
+        universe = event.get("universe")
+        if list_name == "acronyms":
+            new_word = self.validate_acronym_entry(new_word)
+            if not self.confirm_acronym_word_conflict(
+                new_word,
+                self.acronym_word_conflicts_for_location(
+                    new_word,
+                    target,
+                    language=language,
+                    universe=universe,
+                ),
+            ):
+                return False
+        elif list_name in {"words", "names"} and not re.search(r"\s", new_word):
+            if not self.confirm_word_acronym_conflict(
+                new_word,
+                self.word_acronym_conflicts_for_location(
+                    new_word,
+                    target,
+                    language=language,
+                    universe=universe,
+                ),
+            ):
+                return False
         changed_paths = []
         for path in self.dictionary_paths_for_event(event):
             missing = self.remove_entries_from_file(path, [old_word])
@@ -4121,20 +6429,61 @@ class SubtitleCleanupTool:
             if event.get("base_language") in {"american", "british"}:
                 payload["base_language"] = event["base_language"]
             self.log_event(payload)
+        return bool(changed_paths)
 
     def move_dictionary_word(self, event: dict, target: str, universe: Optional[str]) -> bool:
-        word = event.get("word", "")
-        list_name = self.dictionary_list_name(event)
-        filename = f"{list_name}.txt"
         language = None
         if target == "user":
             # Ask language so we do not add to the wrong User Dictionary.
             language = self.choose_language()
             if not language:
                 return False
+        word = str(event.get("word", ""))
+        list_name = self.dictionary_list_name(event)
+        if list_name == "acronyms":
+            word = self.validate_acronym_entry(word)
+            if not self.confirm_acronym_word_conflict(
+                word,
+                self.acronym_word_conflicts_for_location(
+                    word,
+                    target,
+                    language=language,
+                    universe=universe,
+                ),
+            ):
+                return False
+        elif list_name in {"words", "names"} and not re.search(r"\s", word):
+            if not self.confirm_word_acronym_conflict(
+                word,
+                self.word_acronym_conflicts_for_location(
+                    word,
+                    target,
+                    language=language,
+                    universe=universe,
+                ),
+            ):
+                return False
+        return self.move_dictionary_word_to(event, target, universe, language=language)
+
+    def move_dictionary_word_to(
+        self,
+        event: dict,
+        target: str,
+        universe: Optional[str],
+        *,
+        language: Optional[str] = None,
+    ) -> bool:
+        """Move a recent word/name to an explicit non-interactive destination."""
+        word = event.get("word", "")
+        list_name = self.dictionary_list_name(event)
+        if list_name == "acronyms":
+            word = self.validate_acronym_entry(str(word))
+        filename = f"{list_name}.txt"
+        if target == "user" and language in {"american", "british"}:
             destination = self.user_dir / f"{language}_{list_name}.txt"
-        elif universe:
+        elif target == "universe" and universe:
             destination = self.universe_dir / universe / filename
+            language = None
         else:
             return False
         if destination in self.dictionary_paths_for_event(event):
@@ -4174,7 +6523,8 @@ class SubtitleCleanupTool:
             self.log_event(payload)
 
     def dictionary_list_name(self, event: dict) -> str:
-        return "names" if event.get("list") == "names" else "words"
+        value = event.get("list")
+        return value if value in {"words", "names", "acronyms"} else "words"
 
     def dictionary_paths_for_event(self, event: dict) -> List[Path]:
         list_name = self.dictionary_list_name(event)
@@ -4296,15 +6646,28 @@ class SubtitleCleanupTool:
         return True
 
     def move_substitution(self, event: dict, target: str, universe: Optional[str]) -> bool:
-        source, output = event.get("input", ""), event.get("output", "")
         language = None
         if target == "user":
             language = self.choose_language()
             if not language:
                 return False
+        return self.move_substitution_to(event, target, universe, language=language)
+
+    def move_substitution_to(
+        self,
+        event: dict,
+        target: str,
+        universe: Optional[str],
+        *,
+        language: Optional[str] = None,
+    ) -> bool:
+        """Move a recent substitution to an explicit GUI/CLI destination."""
+        source, output = event.get("input", ""), event.get("output", "")
+        if target == "user" and language in {"american", "british"}:
             path = self.user_dir / f"{language}_substitutions.tsv"
-        elif universe:
+        elif target == "universe" and universe:
             path = self.universe_dir / universe / "substitutions.tsv"
+            language = None
         else:
             return False
         if path in self.substitution_paths_for_event(event):
@@ -4344,7 +6707,8 @@ class SubtitleCleanupTool:
             print(f"User Dictionary Maintenance ({language.title()} English)\n")
             print("1. User words")
             print("2. User names")
-            print("3. User substitutions")
+            print("3. User acronyms")
+            print("4. User substitutions")
             print("0. Go back")
             choice = input("\nChoice: ").strip()
             if choice == "0":
@@ -4354,6 +6718,8 @@ class SubtitleCleanupTool:
             elif choice == "2":
                 self.maintain_word_or_name_file(self.user_dir / f"{language}_names.txt", "user", "names")
             elif choice == "3":
+                self.maintain_word_or_name_file(self.user_dir / f"{language}_acronyms.txt", "user", "acronyms")
+            elif choice == "4":
                 self.maintain_substitution_file(self.user_dir / f"{language}_substitutions.tsv", "user", None)
 
     def maintain_word_or_name_file(self, path: Path, target: str, list_name: str, universe: Optional[str] = None) -> None:
@@ -4372,7 +6738,47 @@ class SubtitleCleanupTool:
                 if additions is None:
                     continue
                 entries, redirected_names = additions
-                added = self.add_word_or_name_entries(path, target, list_name, universe, entries)
+                if list_name in {"words", "names", "acronyms"}:
+                    approved_entries = []
+                    try:
+                        language = (
+                            self.user_language_for_path(path)
+                            if target == "user"
+                            else None
+                        )
+                        for entry in entries:
+                            if list_name == "acronyms":
+                                entry = self.validate_acronym_entry(entry)
+                                conflicts = self.acronym_word_conflicts_for_location(
+                                    entry,
+                                    target,
+                                    language=language,
+                                    universe=universe,
+                                )
+                                confirmed = self.confirm_acronym_word_conflict(
+                                    entry, conflicts
+                                )
+                            elif re.search(r"\s", entry):
+                                confirmed = True
+                            else:
+                                conflicts = self.word_acronym_conflicts_for_location(
+                                    entry,
+                                    target,
+                                    language=language,
+                                    universe=universe,
+                                )
+                                confirmed = self.confirm_word_acronym_conflict(
+                                    entry, conflicts
+                                )
+                            if confirmed:
+                                approved_entries.append(entry)
+                    except ValueError as error:
+                        pause(f"{error} Press Enter to continue.")
+                        continue
+                    entries = approved_entries
+                added = self.add_word_or_name_entries(
+                    path, target, list_name, universe, entries
+                )
                 if redirected_names:
                     names_path = self.corresponding_names_path(path)
                     added.extend(
@@ -4505,13 +6911,15 @@ class SubtitleCleanupTool:
             if path.exists()
             else []
         )
-        existing_keys = {entry.casefold() for entry in existing}
+        existing_keys = {dictionary_key(entry) for entry in existing}
         added = []
         for entry in sorted_unique(entries):
-            if entry.casefold() in existing_keys:
+            if list_name == "acronyms":
+                entry = self.validate_acronym_entry(entry)
+            if dictionary_key(entry) in existing_keys:
                 continue
             existing.append(entry)
-            existing_keys.add(entry.casefold())
+            existing_keys.add(dictionary_key(entry))
             added.append(entry)
             event = {
                 "type": "dictionary_add",
@@ -4530,11 +6938,108 @@ class SubtitleCleanupTool:
 
     def remove_entries_from_file(self, path: Path, entries: Sequence[str]) -> List[str]:
         existing = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()] if path.exists() else []
-        remove_keys = {entry.casefold() for entry in entries}
-        found_keys = {entry.casefold() for entry in existing if entry.casefold() in remove_keys}
-        remaining = [entry for entry in existing if entry.casefold() not in remove_keys]
+        remove_keys = {dictionary_key(entry) for entry in entries}
+        found_keys = {
+            dictionary_key(entry)
+            for entry in existing
+            if dictionary_key(entry) in remove_keys
+        }
+        remaining = [entry for entry in existing if dictionary_key(entry) not in remove_keys]
         self.save_word_list(path, remaining)
-        return [entry for entry in entries if entry.casefold() not in found_keys]
+        return [entry for entry in entries if dictionary_key(entry) not in found_keys]
+
+    def replace_maintenance_dictionary_entry(
+        self,
+        path: Path,
+        target: str,
+        list_name: str,
+        universe: Optional[str],
+        old_entry: str,
+        new_entry: str,
+    ) -> bool:
+        """Replace one word/name with one atomic list publication."""
+        old_entry = old_entry.strip()
+        new_entry = new_entry.strip()
+        if not old_entry or not new_entry or list_name not in {"words", "names", "acronyms"}:
+            return False
+        if list_name == "acronyms":
+            new_entry = self.validate_acronym_entry(new_entry)
+        existing = (
+            [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if path.exists()
+            else []
+        )
+        old_key = dictionary_key(old_entry)
+        new_key = dictionary_key(new_entry)
+        match_indexes = [
+            index for index, value in enumerate(existing)
+            if dictionary_key(value) == old_key
+        ]
+        if not match_indexes:
+            return False
+        if any(
+            dictionary_key(value) == new_key and index not in match_indexes
+            for index, value in enumerate(existing)
+        ):
+            raise ValueError("That replacement entry already exists in this dictionary.")
+        existing[match_indexes[0]] = new_entry
+        for index in reversed(match_indexes[1:]):
+            existing.pop(index)
+        self.save_word_list(path, existing)
+        payload = {
+            "type": "dictionary_edit",
+            "from": old_entry,
+            "to": new_entry,
+            "target": target,
+            "universe": universe,
+            "list": list_name,
+        }
+        language = self.user_language_for_path(path) if target == "user" else None
+        if language:
+            payload["base_language"] = language
+        self.log_event(payload)
+        return True
+
+    def replace_maintenance_substitution(
+        self,
+        path: Path,
+        target: str,
+        universe: Optional[str],
+        old_source: str,
+        new_source: str,
+        new_output: str,
+    ) -> bool:
+        """Replace one substitution through one atomic map publication."""
+        old_source = old_source.strip()
+        new_source = new_source.strip()
+        new_output = new_output.strip()
+        if not old_source or not new_source or not new_output:
+            return False
+        substitutions = self.load_substitutions(path)
+        old_key = old_source.casefold()
+        new_key = new_source.casefold()
+        if old_key not in substitutions:
+            return False
+        old_output = substitutions[old_key]
+        if new_key != old_key and new_key in substitutions:
+            raise ValueError("That substitution input already exists in this dictionary.")
+        substitutions.pop(old_key)
+        substitutions[new_key] = new_output
+        self.save_substitutions(path, substitutions)
+        payload = {
+            "type": "substitution_edit",
+            "from_input": old_source,
+            "from_output": old_output,
+            "input": new_source,
+            "output": new_output,
+            "target": target,
+            "universe": universe,
+        }
+        language = self.user_language_for_path(path) if target == "user" else None
+        if language:
+            payload["base_language"] = language
+        self.log_event(payload)
+        return True
 
     def maintain_substitution_file(self, path: Path, target: str, universe: Optional[str]) -> None:
         while True:
@@ -4679,7 +7184,7 @@ class SubtitleCleanupTool:
     def create_universe_files(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=False)
         try:
-            for filename in ("words.txt", "names.txt", "substitutions.tsv"):
+            for filename in ("words.txt", "names.txt", "acronyms.txt", "substitutions.tsv"):
                 (path / filename).write_text("", encoding="utf-8")
         except Exception:
             shutil.rmtree(path, ignore_errors=True)
@@ -4687,7 +7192,7 @@ class SubtitleCleanupTool:
 
     def ensure_universe_files(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
-        for filename in ("words.txt", "names.txt", "substitutions.tsv"):
+        for filename in ("words.txt", "names.txt", "acronyms.txt", "substitutions.tsv"):
             file_path = path / filename
             if not file_path.exists():
                 file_path.write_text("", encoding="utf-8")
@@ -4803,21 +7308,28 @@ class SubtitleCleanupTool:
         name = input("Universe name: ")
         if not name:
             return False
-        error = self.universe_name_error(name)
-        if error:
+        try:
+            self.create_universe_named(name)
+        except ValueError as error:
             pause(f"{error} Press Enter to continue.")
             return False
-        path = self.universe_dir / name
-        if self.universe_name_exists(name):
-            pause("That universe already exists. Press Enter to continue.")
-            return False
-        self.create_universe_files(path)
         print(f'\nSuccessfully created universe dictionary files for "{name}":')
         print("- words.txt")
         print("- names.txt")
+        print("- acronyms.txt")
         print("- substitutions.tsv")
-        self.log_event({"type": "universe_create", "universe": name})
         pause()
+        return True
+
+    def create_universe_named(self, name: str) -> bool:
+        """Create a validated Universe Dictionary without interactive prompts."""
+        error = self.universe_name_error(name)
+        if error:
+            raise ValueError(error)
+        if self.universe_name_exists(name):
+            raise ValueError("That universe already exists.")
+        self.create_universe_files(self.universe_dir / name)
+        self.log_event({"type": "universe_create", "universe": name})
         return True
 
     def duplicate_universe_dictionary(self) -> bool:
@@ -4828,18 +7340,29 @@ class SubtitleCleanupTool:
         new_name = input("New universe name: ")
         if not new_name:
             return False
-        error = self.universe_name_error(new_name)
-        if error:
+        try:
+            self.duplicate_universe_named(source, new_name)
+        except ValueError as error:
             pause(f"{error} Press Enter to continue.")
             return False
-        src = self.universe_dir / source
-        dst = self.universe_dir / new_name
-        if self.universe_name_exists(new_name):
-            pause("A universe with that name already exists. Press Enter to continue.")
-            return False
-        self.copy_universe_files(src, dst)
-        self.log_event({"type": "universe_duplicate", "from": source, "to": new_name})
         pause(f'Duplicated "{source}" to "{new_name}". Press Enter to continue.')
+        return True
+
+    def duplicate_universe_named(self, source: str, new_name: str) -> bool:
+        """Copy one Universe Dictionary to a validated new name."""
+        source_error = self.universe_name_error(source)
+        if source_error:
+            raise ValueError(source_error)
+        error = self.universe_name_error(new_name)
+        if error:
+            raise ValueError(error)
+        if self.universe_name_exists(new_name):
+            raise ValueError("A universe with that name already exists.")
+        self.copy_universe_files(
+            self.universe_dir / source,
+            self.universe_dir / new_name,
+        )
+        self.log_event({"type": "universe_duplicate", "from": source, "to": new_name})
         return True
 
     def rename_universe_dictionary(self) -> bool:
@@ -4850,23 +7373,32 @@ class SubtitleCleanupTool:
         new_name = input("New universe name: ")
         if not new_name:
             return False
-        error = self.universe_name_error(new_name)
-        if error:
+        try:
+            self.rename_universe_named(source, new_name)
+        except (RuntimeError, ValueError) as error:
             pause(f"{error} Press Enter to continue.")
             return False
+        pause(f'Renamed "{source}" to "{new_name}". Press Enter to continue.')
+        return True
+
+    def rename_universe_named(self, source: str, new_name: str) -> bool:
+        """Rename a Universe Dictionary without interactive prompts."""
+        source_error = self.universe_name_error(source)
+        if source_error:
+            raise ValueError(source_error)
+        error = self.universe_name_error(new_name)
+        if error:
+            raise ValueError(error)
         if source == new_name:
-            pause("The universe already has that name. Press Enter to continue.")
-            return False
+            raise ValueError("The universe already has that name.")
+        if self.universe_name_exists(new_name, exclude=source):
+            raise ValueError("A universe with that name already exists.")
         src = self.universe_dir / source
         dst = self.universe_dir / new_name
-        if self.universe_name_exists(new_name, exclude=source):
-            pause("A universe with that name already exists. Press Enter to continue.")
-            return False
         if source.casefold() == new_name.casefold():
             temporary = self.universe_dir / f".__universe_rename_{os.getpid()}"
             if temporary.exists():
-                pause("A temporary rename path is already in use. Press Enter to continue.")
-                return False
+                raise RuntimeError("A temporary rename path is already in use.")
             src.rename(temporary)
             try:
                 temporary.rename(dst)
@@ -4878,7 +7410,6 @@ class SubtitleCleanupTool:
         self.ensure_universe_files(dst)
         self.update_active_session_universe(source, new_name)
         self.log_event({"type": "universe_rename", "from": source, "to": new_name})
-        pause(f'Renamed "{source}" to "{new_name}". Press Enter to continue.')
         return True
 
     def delete_universe_dictionary(self) -> bool:
@@ -4896,9 +7427,22 @@ class SubtitleCleanupTool:
         confirm = input("Type DELETE to confirm deletion: ").strip()
         if confirm != "DELETE":
             return False
+        self.delete_universe_named(universe)
+        pause("Universe dictionary deleted. Press Enter to continue.")
+        return True
+
+    def delete_universe_named(self, universe: str) -> bool:
+        """Delete one named Universe Dictionary after recovery-state checks."""
+        error = self.universe_name_error(universe)
+        if error:
+            raise ValueError(error)
+        if self.active_session_uses_universe(universe):
+            raise RuntimeError(
+                "That universe is referenced by an interrupted spellcheck session. "
+                "Resume or restart that session before deleting it."
+            )
         shutil.rmtree(self.universe_dir / universe)
         self.log_event({"type": "universe_delete", "universe": universe})
-        pause("Universe dictionary deleted. Press Enter to continue.")
         return True
 
     def universe_statistics(self, universe: str) -> dict:
@@ -4906,20 +7450,21 @@ class SubtitleCleanupTool:
         return {
             "words": len(self.load_word_set(path / "words.txt")),
             "names": len(self.load_name_map(path / "names.txt")),
+            "acronyms": len(self.load_acronym_set(path / "acronyms.txt")),
             "substitutions": len(self.load_substitutions(path / "substitutions.tsv")),
         }
 
     def show_universe_stats(self) -> None:
         clear_screen()
         print("Universe Dictionary Stats\n")
-        print(f"{'Name':<28} {'Custom Words':>12} {'Names':>8} {'Substitution Pairings':>22}")
+        print(f"{'Name':<28} {'Custom Words':>12} {'Names':>8} {'Acronyms':>10} {'Substitution Pairings':>22}")
         max_len = int(self.options["maximum_universe_display_name_length"])
         universes = self.list_universes()
         if not universes:
             print("(No universe dictionaries exist.)")
         for name in universes:
             stats = self.universe_statistics(name)
-            print(f"{truncate_display(name, max_len):<28} {stats['words']:>12} {stats['names']:>8} {stats['substitutions']:>22}")
+            print(f"{truncate_display(name, max_len):<28} {stats['words']:>12} {stats['names']:>8} {stats['acronyms']:>10} {stats['substitutions']:>22}")
         pause()
 
     def maintain_universe_dictionary(self) -> None:
@@ -4933,7 +7478,8 @@ class SubtitleCleanupTool:
             print(f"Maintain Universe Dictionary: {universe}\n")
             print("1. Universe words")
             print("2. Universe names")
-            print("3. Universe substitutions")
+            print("3. Universe acronyms")
+            print("4. Universe substitutions")
             print("0. Go back")
             choice = input("\nChoice: ").strip()
             if choice == "0":
@@ -4943,6 +7489,8 @@ class SubtitleCleanupTool:
             elif choice == "2":
                 self.maintain_word_or_name_file(path / "names.txt", "universe", "names", universe)
             elif choice == "3":
+                self.maintain_word_or_name_file(path / "acronyms.txt", "universe", "acronyms", universe)
+            elif choice == "4":
                 self.maintain_substitution_file(path / "substitutions.tsv", "universe", universe)
 
 
@@ -5002,6 +7550,26 @@ def replace_first_word(line: str, source_word: str, replacement: str) -> str:
     return pattern.sub(replacement, line, count=1)
 
 
+def replace_visible_span(text: str, start: int, end: int, replacement: str) -> str:
+    """Replace a span measured after HTML-style subtitle tags are removed."""
+    visible_raw_indexes = []
+    tag_matches = iter(HTML_TAG_RE.finditer(text))
+    tag = next(tag_matches, None)
+    raw_index = 0
+    while raw_index < len(text):
+        if tag is not None and raw_index == tag.start():
+            raw_index = tag.end()
+            tag = next(tag_matches, None)
+            continue
+        visible_raw_indexes.append(raw_index)
+        raw_index += 1
+    if not 0 <= start < end <= len(visible_raw_indexes):
+        raise ValueError("The visible replacement span is outside the subtitle line.")
+    raw_start = visible_raw_indexes[start]
+    raw_end = visible_raw_indexes[end - 1] + 1
+    return text[:raw_start] + replacement + text[raw_end:]
+
+
 def replace_first_word_in_lines(lines: Sequence[str], source_word: str, replacement: str) -> List[str]:
     """Replace exactly one occurrence across a subtitle block."""
     result = list(lines)
@@ -5027,7 +7595,9 @@ def count_nonblank_lines(path: Path) -> int:
 
 def main() -> None:
     try:
-        SubtitleCleanupTool().run()
+        tool = SubtitleCleanupTool()
+        tool.check_for_updates_cli()
+        tool.run()
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         sys.exit(130)

@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
-from subtitle_cleanup import DEFAULT_OPTIONS, SubtitleCleanupTool
+from app.subtitle_cleanup import DEFAULT_OPTIONS, DictionaryContext, SubtitleCleanupTool
 
 
 def make_tool() -> SubtitleCleanupTool:
@@ -76,7 +76,225 @@ class DelimitedEntryTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class AcronymStorageTests(unittest.TestCase):
+    def test_runtime_layout_creates_user_acronym_files_for_both_languages(self):
+        tool = make_tool()
+        tool.save_options = Mock()
+        written_paths = []
+        with (
+            patch.object(Path, "mkdir", new=lambda *_args, **_kwargs: None),
+            patch.object(Path, "exists", new=lambda _path: False),
+            patch.object(
+                Path,
+                "write_text",
+                new=lambda path, *_args, **_kwargs: written_paths.append(path),
+            ),
+        ):
+            tool.ensure_folder_structure()
+
+        self.assertIn(tool.user_dir / "american_acronyms.txt", written_paths)
+        self.assertIn(tool.user_dir / "british_acronyms.txt", written_paths)
+
+    def test_acronym_validation_rejects_single_letters_and_punctuation(self):
+        tool = make_tool()
+
+        for value in ("A", "S.G.C.", "SG C", "SG-C"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                tool.validate_acronym_entry(value)
+
+        self.assertEqual(tool.validate_acronym_entry("SG1"), "SG1")
+
+    def test_contextual_time_markers_cannot_be_added_as_acronyms(self):
+        tool = make_tool()
+
+        for value in ("AM", "am", "PM", "pm"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError, "time expressions"
+            ):
+                tool.validate_acronym_entry(value)
+
+    def test_acronym_conflict_reports_matching_active_word_layers(self):
+        tool = make_tool()
+        context = DictionaryContext(
+            language="american",
+            universe="Stargate",
+            base_words={"us"},
+            user_words={"us"},
+            universe_words={"us"},
+        )
+
+        self.assertEqual(
+            tool.acronym_word_conflicts("US", context),
+            [
+                "American English Base Dictionary",
+                "American English User Dictionary",
+                "Stargate Universe Dictionary",
+            ],
+        )
+
+    def test_user_acronym_checks_every_universe_word_list(self):
+        tool = make_tool()
+        tool.load_dictionary_context = Mock(
+            return_value=DictionaryContext(language="american")
+        )
+        tool.list_universes = Mock(return_value=["Alpha", "Beta"])
+        tool.load_word_set = Mock(
+            side_effect=lambda path: {"us"} if path.parent.name == "Beta" else set()
+        )
+        tool.load_name_map = Mock(return_value={})
+
+        conflicts = tool.acronym_word_conflicts_for_location(
+            "US", "user", language="american"
+        )
+
+        self.assertEqual(conflicts, ["Beta Universe Dictionary"])
+
+    def test_universe_acronym_ignores_other_universe_word_lists(self):
+        tool = make_tool()
+        tool.load_dictionary_context = Mock(
+            side_effect=lambda language: DictionaryContext(language=language)
+        )
+        tool.list_universes = Mock(return_value=["Selected", "Other"])
+        tool.load_word_set = Mock(
+            side_effect=lambda path: {"us"} if path.parent.name == "Other" else set()
+        )
+        tool.load_name_map = Mock(return_value={})
+
+        conflicts = tool.acronym_word_conflicts_for_location(
+            "US", "universe", universe="Selected"
+        )
+
+        self.assertEqual(conflicts, [])
+        tool.list_universes.assert_not_called()
+
+    def test_user_word_checks_every_universe_acronym_list(self):
+        tool = make_tool()
+        tool.load_dictionary_context = Mock(
+            return_value=DictionaryContext(language="american")
+        )
+        tool.list_universes = Mock(return_value=["Alpha", "Beta"])
+        tool.load_acronym_set = Mock(
+            side_effect=lambda path: {"XYZ"} if path.parent.name == "Alpha" else set()
+        )
+
+        conflicts = tool.word_acronym_conflicts_for_location(
+            "xyz", "user", language="american"
+        )
+
+        self.assertEqual(conflicts, ["Alpha Universe Dictionary"])
+
+    def test_universe_word_ignores_other_universe_acronym_lists(self):
+        tool = make_tool()
+        tool.load_dictionary_context = Mock(
+            side_effect=lambda language: DictionaryContext(language=language)
+        )
+        tool.list_universes = Mock(return_value=["Selected", "Other"])
+        tool.load_acronym_set = Mock(
+            side_effect=lambda path: {"XYZ"} if path.parent.name == "Other" else set()
+        )
+
+        conflicts = tool.word_acronym_conflicts_for_location(
+            "xyz", "universe", universe="Selected"
+        )
+
+        self.assertEqual(conflicts, [])
+        tool.list_universes.assert_not_called()
+
+    def test_user_acronym_checks_every_universe_name_list(self):
+        tool = make_tool()
+        tool.load_dictionary_context = Mock(
+            return_value=DictionaryContext(language="american")
+        )
+        tool.list_universes = Mock(return_value=["Alpha", "Beta"])
+        tool.load_word_set = Mock(return_value=set())
+        tool.load_name_map = Mock(
+            side_effect=lambda path: {"qelari": "Qelari"}
+            if path.parent.name == "Alpha"
+            else {}
+        )
+
+        conflicts = tool.acronym_word_conflicts_for_location(
+            "QELARI", "user", language="american"
+        )
+
+        self.assertEqual(conflicts, ["Alpha Universe Dictionary"])
+
+
 class UserDictionaryMutationTests(unittest.TestCase):
+    def test_acronym_addition_preserves_canonical_casing_and_metadata(self):
+        tool = make_tool()
+        path = tool.universe_dir / "Stargate SG-1" / "acronyms.txt"
+        tool.save_word_list = Mock()
+
+        added = tool.add_word_or_name_entries(
+            path, "universe", "acronyms", "Stargate SG-1", ["MALP", "GDO"]
+        )
+
+        self.assertEqual(added, ["GDO", "MALP"])
+        tool.save_word_list.assert_called_once_with(path, ["GDO", "MALP"])
+        self.assertEqual(
+            [call.args[0]["list"] for call in tool.log_event.call_args_list],
+            ["acronyms", "acronyms"],
+        )
+    def test_gui_recent_move_uses_explicit_user_language_without_prompt(self):
+        tool = make_tool()
+        event = {
+            "target": "universe",
+            "universe": "Stargate",
+            "list": "names",
+            "word": "Harriman",
+        }
+        tool.add_word_to_file = Mock()
+        tool.delete_dictionary_word = Mock()
+
+        moved = tool.move_dictionary_word_to(
+            event, "user", None, language="british"
+        )
+
+        self.assertTrue(moved)
+        tool.add_word_to_file.assert_called_once_with(
+            tool.user_dir / "british_names.txt", "Harriman"
+        )
+        tool.delete_dictionary_word.assert_called_once_with(event, log=False)
+        tool.log_event.assert_called_once_with({
+            "type": "dictionary_move",
+            "word": "Harriman",
+            "list": "names",
+            "from_target": "universe",
+            "from_universe": "Stargate",
+            "from_base_language": None,
+            "to_target": "user",
+            "to_universe": None,
+            "to_base_language": "british",
+            "base_language": "british",
+        })
+
+    def test_gui_style_dictionary_edit_is_published_once_and_logged(self):
+        tool = make_tool()
+        path = tool.user_dir / "american_names.txt"
+        tool.save_word_list = Mock()
+        with (
+            patch.object(Path, "exists", return_value=True),
+            patch.object(Path, "read_text", return_value="Harriman\nO'Neill\n"),
+        ):
+            changed = tool.replace_maintenance_dictionary_entry(
+                path, "user", "names", None, "Harriman", "Walter Harriman"
+            )
+
+        self.assertTrue(changed)
+        tool.save_word_list.assert_called_once_with(
+            path, ["Walter Harriman", "O'Neill"]
+        )
+        tool.log_event.assert_called_once_with({
+            "type": "dictionary_edit",
+            "from": "Harriman",
+            "to": "Walter Harriman",
+            "target": "user",
+            "universe": None,
+            "list": "names",
+            "base_language": "american",
+        })
+
     def test_additions_are_case_insensitive_logged_and_report_actual_changes(self):
         tool = make_tool()
         path = tool.user_dir / "american_words.txt"
@@ -227,6 +445,65 @@ class UserDictionaryMutationTests(unittest.TestCase):
 
 
 class UserSubstitutionMaintenanceTests(unittest.TestCase):
+    def test_gui_recent_substitution_move_uses_explicit_destination(self):
+        tool = make_tool()
+        event = {
+            "target": "user",
+            "base_language": "american",
+            "input": "goauld",
+            "output": "Goa'uld",
+        }
+        tool.add_substitution_to_file = Mock()
+        tool.delete_substitution = Mock()
+
+        moved = tool.move_substitution_to(
+            event, "universe", "Stargate"
+        )
+
+        self.assertTrue(moved)
+        tool.add_substitution_to_file.assert_called_once_with(
+            tool.universe_dir / "Stargate" / "substitutions.tsv",
+            "goauld",
+            "Goa'uld",
+        )
+        tool.delete_substitution.assert_called_once_with(event, log=False)
+        tool.log_event.assert_called_once_with({
+            "type": "substitution_move",
+            "input": "goauld",
+            "output": "Goa'uld",
+            "from_target": "user",
+            "from_universe": None,
+            "from_base_language": "american",
+            "to_target": "universe",
+            "to_universe": "Stargate",
+            "to_base_language": None,
+        })
+
+    def test_gui_style_substitution_edit_is_published_once_and_logged(self):
+        tool = make_tool()
+        path = tool.user_dir / "british_substitutions.tsv"
+        tool.load_substitutions = Mock(return_value={"goauld": "Goauld"})
+        tool.save_substitutions = Mock()
+
+        changed = tool.replace_maintenance_substitution(
+            path, "user", None, "goauld", "goauld", "Goa'uld"
+        )
+
+        self.assertTrue(changed)
+        tool.save_substitutions.assert_called_once_with(
+            path, {"goauld": "Goa'uld"}
+        )
+        tool.log_event.assert_called_once_with({
+            "type": "substitution_edit",
+            "from_input": "goauld",
+            "from_output": "Goauld",
+            "input": "goauld",
+            "output": "Goa'uld",
+            "target": "user",
+            "universe": None,
+            "base_language": "british",
+        })
+
     def test_user_substitution_event_language_is_inferred_from_path(self):
         tool = make_tool()
         path = tool.user_dir / "british_substitutions.tsv"

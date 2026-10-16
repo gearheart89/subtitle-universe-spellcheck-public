@@ -1,9 +1,11 @@
 import io
+import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from subtitle_cleanup import DEFAULT_OPTIONS
+from app.subtitle_cleanup import DEFAULT_OPTIONS
 from tests.test_spellcheck import make_tool
 
 
@@ -60,6 +62,69 @@ class AtomicSubtitleWriteTests(unittest.TestCase):
 
 
 class BackupFailureTests(unittest.TestCase):
+    def test_cli_backup_restore_confirmation_restores_exact_bytes(self):
+        tool = make_tool()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            subtitle = root / "episode.srt"
+            archive_path = root / "backup_subtitles.zip"
+            original = b"1\r\n00:00:01,000 --> 00:00:02,000\r\nOriginal line.\r\n"
+            subtitle.write_bytes(b"changed")
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("episode.srt", original)
+            tool.select_target_folder = Mock(return_value=root)
+
+            with (
+                patch("builtins.input", side_effect=["YES", ""]),
+                patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                tool.restore_subtitles_from_backup_cli()
+
+            self.assertEqual(subtitle.read_bytes(), original)
+            self.assertTrue(archive_path.is_file())
+            self.assertIn(
+                "Restored 1 subtitle file(s) from 1 archive(s).",
+                output.getvalue(),
+            )
+            self.assertIn("The backup archives were retained.", output.getvalue())
+
+    def test_restore_discovers_and_restores_root_and_child_archives(self):
+        tool = make_tool()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            child = root / "Season 1"
+            child.mkdir()
+            (root / "episode.srt").write_text("changed", encoding="utf-8")
+            (child / "episode.srt").write_text("changed", encoding="utf-8")
+            with zipfile.ZipFile(root / "backup_subtitles.zip", "w") as archive:
+                archive.writestr("episode.srt", "root original")
+            with zipfile.ZipFile(child / "backup_subtitles.zip", "w") as archive:
+                archive.writestr("episode.srt", "child original")
+
+            result = tool.restore_backup_archives(root)
+
+            self.assertEqual(result, (2, 2))
+            self.assertEqual((root / "episode.srt").read_text(), "root original")
+            self.assertEqual((child / "episode.srt").read_text(), "child original")
+            self.assertTrue((root / "backup_subtitles.zip").exists())
+            self.assertTrue((child / "backup_subtitles.zip").exists())
+
+    def test_restore_rejects_traversal_before_overwriting_files(self):
+        tool = make_tool()
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            subtitle = root / "episode.srt"
+            subtitle.write_text("current", encoding="utf-8")
+            with zipfile.ZipFile(root / "backup_subtitles.zip", "w") as archive:
+                archive.writestr("episode.srt", "original")
+                archive.writestr("../outside.srt", "unsafe")
+
+            with self.assertRaisesRegex(ValueError, "unsafe path"):
+                tool.restore_backup_archives(root)
+
+            self.assertEqual(subtitle.read_text(), "current")
+            self.assertFalse((root.parent / "outside.srt").exists())
+
     def test_disabled_backups_can_be_enabled_before_editing(self):
         tool = make_tool()
         tool.options = dict(DEFAULT_OPTIONS)

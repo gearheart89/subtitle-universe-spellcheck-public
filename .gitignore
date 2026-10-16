@@ -21,6 +21,10 @@ dictionaries/base/*
 !dictionaries/base/british_words.txt
 !dictionaries/base/README.md
 !dictionaries/base/SCOWL-COPYRIGHT.txt
+/launch gui.txt
+/launch cli.txt
+/launch gui.txt.tmp
+/launch cli.txt.tmp
 /Test Files/
 backup_subtitles.zip
 *.srt

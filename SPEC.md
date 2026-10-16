@@ -11,27 +11,35 @@ The tool may automatically apply deterministic formatting rules and explicitly c
 The tool uses three dictionary layers:
 
 - **Base dictionary:** immutable American or British English vocabulary. Exactly one base language is active.
-- **User dictionary:** personal words, names, and substitutions that are always loaded for the selected base language.
-- **Universe dictionary:** optional words, names, and substitutions for one specific show, franchise, or project. At most one universe is active during a run.
+- **User dictionary:** personal words, names, acronyms, and substitutions that are always loaded for the selected base language.
+- **Universe dictionary:** optional words, names, acronyms, and substitutions for one specific show, franchise, or project. At most one universe is active during a run.
 
 Dictionary precedence and casing authority are:
 
 1. Active session substitutions.
 2. Universe and user substitutions.
 3. Universe and user name lists, preserving their stored case.
-4. Known acronyms.
+4. User and Universe acronym lists, preserving their stored canonical case, followed by compatible derived/common acronyms.
 5. Universe and user word lists.
 6. Base vocabulary.
 7. Conservative sentence-casing fallback.
 
 Internal apostrophes, including straight and curly forms, are part of a word token.
+Straight `'` and typographic `’` apostrophes have the same dictionary identity,
+so `don't` and `Don’t` match without rewriting the subtitle's punctuation.
 Known-token checks use direct membership in the active base, user, and universe
 sets; scanning must not rebuild their combined vocabulary for every token.
 
 ## 3. Repository and runtime layout
 
 ```text
-subtitle_cleanup.py
+app/
+    subtitle_cleanup.py
+    subtitle_gui.py
+SubtitleUniverseSpellcheck.pyw
+tools/
+    build_multiplatform_release.py
+    build_windows.ps1
 SPEC.md
 STATUS.md
 docs/
@@ -39,6 +47,7 @@ docs/
 tests/
 dictionaries/                  # base assets tracked; writable runtime data ignored
     options.ini
+    gui_theme.json
     session_state.json
     session_log.jsonl
     base/
@@ -47,14 +56,17 @@ dictionaries/                  # base assets tracked; writable runtime data igno
     user/
         american_words.txt
         american_names.txt
+        american_acronyms.txt
         american_substitutions.tsv
         british_words.txt
         british_names.txt
+        british_acronyms.txt
         british_substitutions.tsv
     universes/
         <Universe Name>/
             words.txt
             names.txt
+            acronyms.txt
             substitutions.tsv
 ```
 
@@ -67,7 +79,19 @@ to match the Version 1 ASCII tokenizer, lowercased, restricted to supported
 single-word token forms, deduplicated, and sorted. The source, generation
 parameters, and required redistribution notice are stored beside the lists.
 
-Word and name files contain one entry per line. Substitution files contain `input<TAB>output`. Substitution input matching is case-insensitive; output is emitted exactly as stored. Lists are sorted after maintenance operations, with substitutions sorted by input.
+Word, name, and acronym files contain one entry per line. Acronyms are stored as one undotted alphanumeric token in authoritative casing. Their simple plural and possessive forms are recognized, and a recognized dotted spelling is normalized to the stored casing. Substitution files contain `input<TAB>output`. Substitution input matching is case-insensitive; output is emitted exactly as stored. Lists are sorted after maintenance operations, with substitutions sorted by input.
+
+Before adding a single-token acronym, the application checks for the same
+case-insensitive spelling in relevant accepted-word and authoritative-name
+lists and requires confirmation when a collision exists. A Universe acronym
+checks both Base/User language pairs plus only its own Universe; a User acronym
+checks its selected Base/User language plus every Universe because that User
+dictionary can be combined with any of them. Adding a single-token word or
+name performs the inverse check against relevant built-in, User, and Universe
+acronyms with the same scope rules. These collisions are advisory because some
+are intentional. `AM` and `PM` are the exception: their contextual time
+handling is built in, so explicit acronym entries for either spelling are
+rejected with an explanation.
 
 Multiword entries are exact, phrase-scoped dictionary entries. Multiword names
 provide authoritative casing for the complete phrase; multiword words accept
@@ -78,7 +102,274 @@ punctuation, and may cross a subtitle line wrap within one cue. Simple plural
 and possessive forms of known acronyms retain the acronym's canonical casing,
 for example `MALPs`, `GDOs`, and `SGC's`.
 
-The application remains a single-file, standard-library-only Python program unless a later design decision explicitly changes that constraint.
+The application remains standard-library-only. The tested subtitle engine and
+command-line interface remain in `app/subtitle_cleanup.py`. The approved graphical
+interface is a thin Tkinter launcher in `app/subtitle_gui.py`; it must call the
+same engine rather than duplicate spelling, formatting, dictionary, backup, or
+write-safety behavior.
+
+GUI colors are resolved through an internal theme registry. The original visual
+design is the built-in `Ocean` baseline and fresh-install default. `Dark` is a
+second immutable built-in palette. Settings exposes a Themes workspace where
+the user selects Ocean, Dark, or Custom; the saved choice applies on the next
+application start. Custom begins as a complete Ocean copy and exposes every
+existing semantic color role as a validated `#RGB` or `#RRGGBB` input with a
+plain-language description. It can be reset to either Ocean or Dark before
+saving. After an actual selected-theme or active-Custom color change is saved,
+the GUI offers to restart immediately; an unchanged save does not prompt. The
+cross-platform restart supports source, `.pyw`, and frozen executable launches,
+checkpoints retained review state, launches the replacement, and closes the old
+Tk instance only after that launch succeeds. The choice
+and complete Custom palette are atomically persisted in ignored portable file
+`dictionaries/gui_theme.json`. Theme editing must not create extra color roles,
+and widget code must not contain theme-specific branches.
+Leaving Themes with an unsaved theme selection or Custom color edit prompts to
+save, discard, or cancel navigation. Saving through that prompt uses the same
+validation and restart offer as the explicit Save theme button; a failed save
+or Cancel keeps the Themes workspace open.
+Options, dictionary-maintenance, and Recent Additions alternating rows must use
+the same `row_white` and `row_light` palette entries rather than independent
+literals.
+
+Boolean option switches must not communicate state through red and green alone.
+Their moving knob contains a theme-controlled check mark when enabled and an ×
+when disabled, retaining color as a secondary cue while supporting users with
+red/green color-vision deficiencies.
+
+Large titles must reuse the background color of their containing surface.
+Page-level titles use `surface`; titles inside cards use `card`. This prevents a
+label-sized rectangle around card titles without adding another Custom-theme
+color choice.
+
+Application-owned ttk controls use one palette-driven style layer rendered by
+the cross-platform `clam` engine when available. The layer covers buttons,
+entries, comboboxes and their popdown lists, Treeviews and headings, vertical
+and horizontal scrollbars, separators, frames, and labels. Classic Tk listboxes
+receive equivalent palette options through one helper. Theme limitations are
+restricted to operating-system-owned title bars, window borders, native
+file/folder dialogs, and native message boxes; those intentionally follow the
+host operating system.
+
+Returning to Formatting Only, Standard Spellcheck, or Universe Spellcheck from
+any maintenance workspace must replace the maintenance status-bar message with
+the current scan state. An idle scan identifies the selected mode and prompts
+for Start scan; a retained review reports whether it is paused, awaiting an
+action, or ready to save instead of presenting stale maintenance text.
+
+The scan workspace must remain usable on smaller displays. Its readable content
+width protects complete action and scope-button labels and its natural height
+protects the bottom controls. When the window viewport is smaller than either
+dimension, theme-neutral horizontal and/or vertical scrollbars appear around
+the scan workspace; each scrollbar hides again when its overflow is removed.
+The application minimum remains small enough for compact monitors rather than
+forcing the full workspace width or height onto the physical display.
+
+## 3.1 Graphical launcher
+
+Running `app/subtitle_gui.py` without arguments opens the Tkinter interface on
+Windows, macOS, or Linux. Running it with `--cli` starts the established
+command-line interface. Directly running `app/subtitle_cleanup.py` also continues
+to start the command-line interface.
+
+Root-level `SubtitleUniverseSpellcheck.pyw` is the portable interface chooser.
+On first use it requires an explicit `1` for GUI or `2` for CLI and writes
+exactly one human-readable marker beside itself: `launch gui.txt` or
+`launch cli.txt`. Later launches announce the saved choice and provide a
+five-second opportunity to press Enter and choose again before continuing.
+Changing the choice atomically creates the new marker and removes the old one;
+deleting the marker manually restores first-run selection. Both markers are
+ignored runtime data and are absent from release archives.
+
+When a terminal is available, selection and the five-second override use text
+prompts. A Windows `.pyw` process has no console, so it provides the equivalent
+small Tk chooser/countdown; choosing CLI starts `app/subtitle_gui.py --cli` in
+a new console window. On macOS and Linux, choosing GUI from a terminal starts a
+detached child with standard streams closed, while choosing CLI remains in the
+current terminal. The detached GUI child bypasses the chooser to prevent a
+second prompt. This makes an accidental GUI selection on a console-only host
+recoverable on the next terminal launch. Startup failures without a console
+are presented in an error dialog. Desktop double-click association remains an
+operating-system/user configuration rather than an application guarantee.
+
+The Version 1 GUI and CLI have feature parity for scanning, formatting,
+spellcheck decisions and scopes, dictionary maintenance, recent additions,
+options, themes, About information, session-log maintenance, recovery, and
+guarded backup restoration. Future GUI behavior must remain visibly disabled
+or identify itself as not yet connected until it uses the shared engine and is
+covered by regression tests; interface code must not duplicate formatting,
+dictionary, backup, recovery, or write-safety rules. Formatting Only selects a
+folder and Base language, discovers `.srt` files using the configured
+recursive option, and runs the complete production formatter in memory on a
+worker thread. It reports file/cue progress, supports Pause, Resume, Stop, and
+Restart, summarizes changed files, and displays every report-only validation
+finding without modifying it. Save changes uses the same confirmation, backup,
+external-drift check, encoding preservation, atomic writes, and rollback path
+as spellcheck review. Formatting progress, prepared blocks, validation
+findings, and unsaved changes are included in GUI crash recovery.
+
+The spellcheck review screen prepares cues in memory using the production
+formatting order and displays genuine unknowns with up to six
+production suggestions, two preceding cues, two following cues, and exact
+selected-occurrence highlighting. Preparation and advancement run outside the
+Tk event thread and report progress. The GUI supports Ignore followed by This
+time or This session, retaining already prepared cues and treating repeated
+copies of a word in one cue as separate occurrences. Session-scope ignores are
+case-insensitive and last only for that GUI review. The GUI atomically
+checkpoints prepared cues, its current position, occurrence/session ignores,
+and Undo history to an ignored compressed recovery journal after each stable
+review state. On the next launch, the user may recover or discard that journal.
+Recovery is refused if a prepared source file no longer matches its recorded
+baseline. A restored current issue is revalidated with the running version's
+dictionary rules and advances automatically if it is no longer unknown. The
+journal does not write any subtitle; Undo reverses GUI occurrence
+and session ignores in last-in,
+first-out order and returns the review to the affected occurrence, including
+after the scan has otherwise reached its end.
+Displayed suggestions are selectable GUI actions. Choosing one enables This
+time, This session, Always, and This universe when a Universe Dictionary is
+active. This time replaces only the highlighted occurrence. This session
+retains a case-insensitive substitution for the remainder of the review.
+This universe and Always atomically persist the same rule to the active
+Universe or selected-language User substitutions file. Scoped rules propagate
+through later prepared cues and files. Their originating and propagated edits
+form one repeatable GUI Undo action; persistent Undo also restores the prior
+dictionary rule. The recovery journal retains active review substitutions,
+their propagated edits, and Undo metadata. Replacement respects HTML-style
+subtitle tags and remains in memory until Save changes writes subtitle files.
+Edit/Substitute turns the dialogue area of the Current subtitle panel into an
+editable field while displaying the cue timestamp separately as read-only
+metadata. The button becomes Cancel edit while editing. This time replaces the
+complete prepared cue text, may change its line wrapping, advances the review,
+and records the prior complete text in the repeatable GUI Undo history. Empty
+dialogue and internal blank lines are rejected because they would produce an
+invalid or structurally ambiguous SRT cue. This action also remains in memory
+and does not alter the source subtitle.
+Search line opens an explicit Google search for the exact highlighted dialogue
+line using the shared markup-stripping behavior and leaves the review state
+unchanged.
+Save changes becomes available only when prepared subtitle bytes differ from
+the session's saved baseline. It reports the number of affected files, asks
+for confirmation, and, when the backup option is disabled, offers to enable
+backups, save once without a backup, or cancel. Before writing, the shared
+engine verifies that every affected source still matches the bytes originally
+prepared. It then creates or retains the normal grouped ZIP archives and uses
+the same encoding-preserving atomic subtitle writes as the CLI. A failed later
+write rolls back any earlier files written by that save. A successful save
+establishes a new baseline and clears the pre-save GUI Undo history. Stop,
+Restart, and window close require confirmation before discarding unsaved text.
+The primary scan control identifies whether it will Start, Resume, or Restart
+the scan. Active background spelling work can be paused and resumed without
+discarding completed preparation or occurrence ignores. Stopping explicitly
+clears only the GUI's in-memory review state. A scan waiting at an unknown is
+already paused for user review. Pause and Stop are separate, permanently
+labeled controls; the Pause control has no code path that clears a session.
+
+The GUI displays the Base choices as `American English` and `British English`
+while retaining the stable `american` and `british` keys in dictionary paths,
+saved review state, and engine calls. A light-blue question-mark help icon is
+shown beside the scan language selector, User Dictionary Base-language list,
+and the move form's Base-language choice. Its hover tooltip explains that
+American uses forms such as `color` and `center`, British uses `colour` and
+`centre`, and the British dictionary accepts both standard `-ise` and Oxford
+British `-ize` forms such as `organise`/`organize`. The language selector
+remains enabled for Formatting Only because formatting loads language-specific
+user substitutions and names and uses dictionary context for casing behavior.
+When Standard spellcheck disables the Universe selector, a light-blue help
+icon beside it directs users who need a Universe Dictionary to choose Universe
+spellcheck in the left pane; the icon is hidden in other scan modes. Selecting
+Universe spellcheck exposes `Add a universe…` as the permanently first item in
+the scan selector, followed by `No universe` and the alphabetized Universe
+names. Choosing the action uses the same validated creation operation as
+maintenance and immediately selects a successfully created Universe; cancelling
+or failing restores the prior selection. The selector's popdown is capped and
+scrolls rather than growing indefinitely. The Universe-maintenance list likewise
+remains bounded and shows its vertical scrollbar only while its entries exceed
+the visible area.
+Selecting
+User Dictionary or Universe Dictionary replaces the scan workspace in the main window with dictionary
+maintenance; it does not open a secondary window. User maintenance presents
+the two Base languages in its left column. Words/phrases, authoritative names,
+canonical acronyms, and substitutions are separate entry types. Universe maintenance presents an
+alphabetized Universe list in its left column with Add, Copy, Rename, and
+Delete controls. The entry area switches among words/phrases, authoritative
+names, acronyms, and substitutions. Words, names, and acronyms use one entry column. Substitutions
+use separate `Find word / phrase` and `Replace with` columns. Entry controls
+support adding, editing, moving, and removing entries. Moving uses the same
+destination picker as Recent Additions. Content rewrites are atomic,
+and an edit is published as one replacement rather than a separate delete and
+add. Universe lifecycle operations use the same validated engine methods as
+the command-line menus. Selecting Recent Additions replaces the scan workspace
+with a current-state review reconstructed from the append-only session log and
+verified against the dictionary files on disk. The review switches between
+words/names/acronyms and substitutions, identifies the exact User language or Universe
+location, and supports refresh, edit, move, and remove. Edits use the same
+single-publication atomic operations as dictionary maintenance. The move form
+first selects User Dictionary or Universe Dictionary with radio buttons, then
+populates its dropdown with only Base languages or Universes for that type.
+It excludes the entry's current location. The command-line recent-addition
+screens remain available and share the same reconstruction and mutation logic.
+Recent Additions and dictionary-maintenance entry tables use native extended
+selection: Ctrl toggles individual rows and Shift selects a contiguous range.
+Move applies one chosen destination to every selected entry, and Remove uses
+one batch confirmation before removing every selected entry. Edit remains a
+single-entry operation; invoking it with multiple rows selected displays an
+explanation and makes no changes.
+
+Dictionary and Universe-name entry forms are horizontally resizable and use
+larger padded fields. A substitution is entered in one form containing both
+Find and Replace fields; Enter advances from Find to Replace and submits from
+Replace. These forms open centered over the current main-window bounds rather
+than at a fixed screen corner, including when the main window has moved. The
+substitution table is one spreadsheet-style two-column table separated by a
+single draggable column boundary and a matching faint-gray rule through the
+table body. One automatically hidden horizontal scrollbar serves the table.
+The substitution columns do not auto-stretch after a manual divider drag, so
+their chosen widths and any resulting horizontal overflow remain in effect
+while that dictionary view stays active. Selecting another Base/Universe or
+switching the dictionary entry type resets the columns to fit the window.
+Cell text that does not fit its current column is display-truncated with a
+trailing ellipsis while the complete underlying value remains available to
+Edit, Move, and Remove operations.
+Dictionary-maintenance and Recent Additions tables alternate light and very
+light gray rows to make wide entries easier to track. The sidebar separates its heading groups with thin
+light-blue rules. On Windows the process receives a stable application identity
+before Tk starts so its taskbar button uses the window's quill icon rather than
+the Python executable icon.
+
+An About item appears beneath Options. Its main-window view shows the running
+version, the public GitHub project link, the MIT source-license identification,
+the SCOWL version and primary copyright/permission notice, a clickable link to
+the exact bundled SCOWL release tag, and the path of the complete bundled SCOWL
+notice. CLI menu item `10. About this tool` prints the same version, project
+URL, MIT identification, SCOWL attribution, exact release URL, and bundled
+notice path. Both interfaces obtain these values from shared engine constants.
+
+Selecting Options replaces the scan workspace with a main-window settings
+workspace. Its left column contains the same five categories as the CLI; the
+right column shows every option in that category with its current value,
+inline example when available, and a light-blue help icon exposing the shared
+description. Boolean changes validate and save immediately. Positive-integer
+changes save through Apply or Enter. The Universe display-length warning and
+explicit confirmation above 32 characters are retained. GUI and CLI settings
+use the same in-memory values and atomically published `options.ini` file.
+
+The completed GUI must retain the CLI's backup prompts, recovery behavior,
+scope semantics, undo guarantees, format preservation, and conservative
+correction policy. Long-running preparation and scanning must run without
+freezing the window and report bounded progress updates.
+
+Add word / name / acronym / phrase opens an editable dictionary-entry dialog initialized
+with the selected unknown. The user may retain that single word or expand it
+to an exact phrase present in the current cue, choose accepted term versus
+authoritative name casing, and explicitly choose the User Dictionary or active
+Universe Dictionary. A phrase must include the selected unknown and match the
+cue using whitespace-only token separation, including across a subtitle line
+wrap. Adding a phrase never accepts its individual components elsewhere.
+Dictionary additions are persisted immediately and appear in the recent-entry
+log. Authoritative names recase the selected occurrence or complete phrase in
+the prepared cue; that subtitle change remains in memory until Save changes.
+GUI Undo removes the added dictionary entry, updates the active context, and
+restores any name-casing change.
 
 ## 4. Main menu
 
@@ -100,12 +391,20 @@ Dictionary Maintenance:
 Info/Maintenance:
 9. What do Base, User, and Universe mean?
 10. About this tool
-11. Flush session log
+11. Flush session log [enter 11? for help]
 
 0. Exit
 ```
 
 Menus clear the console before rendering and provide a way to return without making changes. Help screens explain the dictionary layers, supported cleanup operations, session recovery, and the conservative correction policy.
+
+Entering `11?` from the CLI main menu explains that flushing the append-only
+session log removes the history shown by Recent additions but does not delete
+dictionary entries or clear interrupted-session recovery. Selecting `11`
+retains the typed `FLUSH` confirmation before the log is atomically emptied.
+The GUI exposes the same operation as **Flush session log** beneath Settings.
+Its main-window maintenance view presents the same scope explanation and an
+irreversible-action confirmation before using the shared engine operation.
 
 The universe-capable spellcheck path lists existing universe dictionaries and
 also offers to create a new universe, continue without a universe dictionary,
@@ -122,16 +421,20 @@ from creation, no-universe, pagination, and back controls.
 Options are stored in `dictionaries/options.ini`, take effect immediately, and
 are organized into File Discovery and Safety, Spelling and Text Cleanup,
 Subtitle Layout and Dialogue, Common Error Cleanup, and Menus and Display
-submenus. They include:
+submenus. Options and writable word, name, and substitution dictionaries are
+published through flushed sibling temporary files and atomic replacement so an
+interrupted rewrite cannot expose a partially written final file. They include:
 
 | Option | Default |
 | --- | ---: |
 | Scan folders recursively | `true` |
+| Capitalization preference | `Ask always` |
 | Recognize informal `-in'` forms when the `-ing` word is known | `true` |
 | Remove periods from abbreviations | `true` |
 | Convert `--` and `...` to `…` | `false` |
 | Title-case bracketed sound effects | `true` |
 | Fix capitalization when a line is mostly uppercase | `true` |
+| Capitalize lowercase pronoun `i` and its contractions | `true` |
 | Adjust subtitle line count and length | `true` |
 | Preferred maximum visible dialogue lines | `2` |
 | Count sound-effect lines toward the visible-line limit | `false` |
@@ -152,6 +455,25 @@ submenus. They include:
 
 Boolean entry accepts `yes/y/true/t/1/on` and `no/n/false/f/0/off`, case-insensitively. Numeric options accept positive whole numbers. Entering `<option>?` displays examples and guidance. Common-error options also show short before-and-after examples directly in their submenu.
 
+The GUI presents these same groups in its Options workspace. Boolean settings
+use compact left-aligned pill switches with a red disabled state and green
+enabled state, and save immediately. Numeric fields remain right-aligned and
+save through Apply or the Enter key. Setting rows alternate white and light
+gray to support visual tracking. Every row reserves the same fixed-width right
+zone: its blue question-mark help icon occupies one fixed position beneath a
+`Tooltips` heading, while numeric controls use the remaining space without
+influencing that position. The icons display the descriptions above.
+
+Capitalization preference offers Ask always, Source capitalization, Subtitle-aware
+capitalization, and All caps. Ask always requests one of the three concrete modes
+at each new scan and offers a Remember my choice checkbox; an unchecked choice is
+limited to that scan. Resuming or recovering an in-progress scan reuses its
+checkpointed effective choice without asking again. Source capitalization retains source letter case;
+Subtitle-aware capitalization enables the conservative capitalization rules in
+Section 9; All caps uppercases visible subtitle text while preserving markup.
+In All caps mode, capitalization rules that can no longer affect output are
+disabled in the GUI and their tooltip explains how to change the mode.
+
 When informal dropped-`g` recognition is enabled, a token ending in straight
 or curly apostrophe after `-in` is accepted only if adding `g` produces a word
 in the active dictionaries. Thus `goin'` and `goin’` are recognized when
@@ -161,7 +483,9 @@ Universe display limits affect menus only. Longer internal names are permitted, 
 
 ## 6. Discovery and target selection
 
-For main-menu actions 1 through 3, the tool first scans from the script folder using the configured recursive behavior.
+For main-menu actions 1 through 3, the tool first scans from the portable
+application root (the parent of `app` for source runs, or the executable folder
+for a frozen build) using the configured recursive behavior.
 
 When subtitles are found, it reports the count and up to five top-level folders, then starts a five-second countdown. Pressing Enter during the countdown opens a custom-location prompt. When no subtitles are found, it explains the searched location and prompts immediately.
 
@@ -171,7 +495,7 @@ ten per page. `1` through `10` enter a folder on the current page, `U` goes up
 one level, `S` selects the displayed folder, `11` and `33` navigate pages when
 available, and `0` returns to the main menu. The user may type an absolute or
 relative folder path instead of browsing; relative paths are resolved from the
-displayed folder first while retaining script-folder and process-folder
+displayed folder first while retaining application-root and process-folder
 fallbacks for compatibility.
 
 Scanning is case-insensitive for the `.srt` extension. With recursive mode disabled, only `.srt` files directly inside the target root are included.
@@ -189,6 +513,17 @@ Backup grouping is:
 - A new archive is built and flushed as a sibling temporary file, then atomically moved into place. Failed or incomplete temporary archives are removed and editing does not begin.
 
 If backup creation is disabled when an editing action begins, the user is offered a safe choice to enable it, continue without a backup, or cancel.
+
+The scan area also exposes restoration when at least one grouped
+`backup_subtitles.zip` exists in the selected root or an immediate child.
+Otherwise the action is disabled and its tooltip identifies the missing
+prerequisite. Restoration validates all archives, CRCs, `.srt` entries, and
+destinations before writing; rejects absolute, traversal, duplicate, and
+non-subtitle entries; then atomically restores every entry. A write failure
+rolls back files already restored where possible. The action requires the user
+to type the exact confirmation `YES`, overwrites current subtitle files, and
+retains the ZIP archives. The CLI provides the same operation from the Subtitle
+Scan menu.
 
 ## 8. SRT parsing and writing
 
@@ -211,11 +546,18 @@ Formatting runs in this order:
 1. Configured deterministic common-error cleanup.
 2. Optional ellipsis normalization.
 3. Configured substitutions.
-4. Optional dotted-acronym normalization.
-5. Optional bracketed sound-effect title casing.
-6. Optional mostly-uppercase repair.
-7. Optional dropped-speaker-break detection.
-8. Optional subtitle reflow.
+4. Selected capitalization mode, including All caps when selected.
+5. Optional lowercase pronoun `i` capitalization in Subtitle-aware mode.
+6. Optional dotted-acronym normalization.
+7. Optional bracketed sound-effect title casing in Subtitle-aware mode.
+8. Optional mostly-uppercase repair in Subtitle-aware mode.
+9. Optional dropped-speaker-break detection.
+10. Optional subtitle reflow.
+11. Authoritative name/acronym casing restoration in Subtitle-aware mode.
+
+Capitalization is applied during the formatting pass before interactive
+spelling prompts are displayed. Source mode bypasses automatic casing repairs;
+All caps changes only visible text and does not uppercase tag markup.
 
 Formatting-only changes do not require individual session-log events.
 
@@ -242,7 +584,17 @@ edit them.
 
 When enabled, runs of `...` and `--` become `…` before other rules. This is disabled by default because a double hyphen may represent interruption rather than an ellipsis.
 
-### 9.2 Dotted acronyms
+### 9.2 Lowercase pronoun `i`
+
+When enabled, standalone lowercase `i` becomes `I` in ordinary dialogue, and
+the common straight- or curly-apostrophe contractions `i'm`, `i'd`, `i'll`,
+and `i've` become `I'm`, `I'd`, `I'll`, and `I've`. The rule operates on
+visible subtitle text after configured substitutions, does not alter tag
+markup, and protects `i.e.` and web addresses. It is a shared formatting rule:
+command-line formatting/spellcheck runs and GUI in-memory preparation call the
+same implementation.
+
+### 9.3 Dotted acronyms
 
 Known dotted acronyms are normalized to their preferred undotted casing, for example `M.A.L.P.` to `MALP`, `S.G.C.` to `SGC`, and `D.H.D.` to `DHD`.
 
@@ -250,11 +602,11 @@ Simple plural and possessive suffixes are retained. A period serving as true
 sentence punctuation is also retained, so sentence-final `G.D.O.s.` becomes
 `GDOs.` rather than `GDOs`.
 
-### 9.3 Bracketed sound effects
+### 9.4 Bracketed sound effects
 
 Bracketed sound effects are title-cased, retaining lowercase connector words except at the beginning or end. Example: `[SOUND OF A DOOR OPENING]` becomes `[Sound of a Door Opening]`.
 
-### 9.4 Mostly-uppercase repair
+### 9.5 Mostly-uppercase repair
 
 Lines with more than 80 percent uppercase letters are conservatively sentence-cased using the dictionary precedence rules. Stored names and acronyms retain authoritative casing.
 
@@ -263,7 +615,7 @@ substitutions introduce canonical mixed-case output. A correction such as
 `TEALD` to `Teal'c` must not prevent the rest of an originally uppercase line
 from being repaired.
 
-### 9.5 Ambiguous `us` and `US`
+### 9.6 Ambiguous `us` and `US`
 
 Mixed-case lowercase `us` remains unchanged. During all-caps repair, a bare `US` defaults to the pronoun `us` unless a strong United States context is detected. Pronoun patterns override country patterns.
 
@@ -271,7 +623,7 @@ Protected country contexts include `US military`, `US government`, service branc
 
 Ambiguous cases prefer lowercase `us`. Dotted `U.S.` and `U.S.A.` are protected and normalized according to the abbreviation option.
 
-### 9.6 Dropped speaker breaks
+### 9.7 Dropped speaker breaks
 
 Probable merged speakers after `.`, `?`, or `!`, optionally followed by a hyphen, are split into two `- ` dialogue lines. The detector must not fire inside abbreviations, decimals, acronyms, URLs, or before closing quotation marks.
 
@@ -288,7 +640,7 @@ becomes:
 - Now?!
 ```
 
-### 9.7 Line reflow
+### 9.8 Line reflow
 
 Normal dialogue aims for 40 characters per line, may extend to 55 to avoid unnecessary lines, and aims for two visible dialogue lines. For text requiring two lines, the split should be balanced rather than greedily filling the first line.
 
@@ -324,7 +676,7 @@ Actions are:
 - Suggestions 1-6.
 - `7` Edit or substitute.
 - `8` Ignore.
-- `9` Add word, name, or exact phrase to a dictionary.
+- `9` Add word, name, acronym, or exact phrase to a dictionary.
 - `S` Search the current subtitle line in Google.
 - `U` Undo.
 - `0` Quit spellcheck.
@@ -343,7 +695,7 @@ Valid combinations:
 | Suggestion 1-6 | 1, 2, 3 when available, 4 |
 | Edit or substitute 7 | 1, 2, 3 when available, 4 |
 | Ignore 8 | 1, 2 |
-| Add word/name/phrase 9 | 3 when available, 4 |
+| Add word/name/acronym/phrase 9 | 3 when available, 4 |
 
 Two-character shortcuts such as `71`, `82`, and `94` are accepted. Invalid combinations explain the permitted alternatives. After an action, the current cue is rescanned so multiple issues can be handled.
 
@@ -368,7 +720,7 @@ extra `re-`. Session and persistent substitutions use the chosen source text,
 and undo restores the complete original cue.
 
 Adding to a dictionary asks whether the entry is an accepted word, an
-authoritative name, an accepted exact phrase, or an authoritative exact name
+authoritative name, an acronym with authoritative casing, an accepted exact phrase, or an authoritative exact name
 phrase. Phrase choices require exact text present in the current cue and must
 include the selected unknown word. Names retain user-confirmed authoritative
 casing and recase the current occurrence immediately, including phrases split
@@ -386,8 +738,9 @@ Undo is repeatable and covers replacements, session choices, dictionary/name add
 
 Recoverable state is stored in `dictionaries/session_state.json`; append-only history is stored as JSONL in `dictionaries/session_log.jsonl`. Missing files mean no aborted session.
 
-Session state is written through a sibling temporary file and atomically
-replaced. A transient Windows permission error during replacement is retried
+Session state is fully flushed through a sibling temporary file and atomically
+replaced. Append-only log events are flushed before their write completes. A
+transient Windows permission error during replacement is retried
 with short bounded delays so an indexer or security scanner cannot terminate
 an otherwise recoverable spellcheck run.
 
@@ -430,9 +783,9 @@ The JSONL log records session lifecycle, file/cue progress needed for recovery, 
 
 Recent dictionary and substitution screens combine user and universe additions from the session log. Entries are alphabetized and may be modified, moved, or deleted. Moving into a universe requires a confirmation naming both the entry and target universe.
 
-User maintenance first selects American or British English, then words, names, or substitutions. Addition/removal accepts one value or a delimited list. Whitespace is trimmed. Multiword entries may be stored as accepted exact phrases, redirected to authoritative name phrases, edited, or omitted.
+User maintenance first selects American or British English, then words, names, acronyms, or substitutions. Addition/removal accepts one value or a delimited list. Whitespace is trimmed. Multiword entries may be stored as accepted exact phrases, redirected to authoritative name phrases, edited, or omitted. Acronym entries are restricted to one undotted alphanumeric token and preserve canonical casing.
 
-Universe maintenance supports create, duplicate, rename, delete with typed `DELETE` confirmation, statistics, and direct word/name/substitution maintenance. Every universe contains `words.txt`, `names.txt`, and `substitutions.tsv`.
+Universe maintenance supports create, duplicate, rename, delete with typed `DELETE` confirmation, statistics, and direct word/name/acronym/substitution maintenance. Every universe contains `words.txt`, `names.txt`, `acronyms.txt`, and `substitutions.tsv`.
 
 ## 13. Version 1 acceptance criteria
 
@@ -441,9 +794,11 @@ Version 1 is complete when all of the following are implemented and tested:
 - Folder structure creation and persistent options.
 - Menus and help screens.
 - Automatic and custom recursive discovery.
-- Grouped ZIP backups.
+- Grouped ZIP backup creation and typed-confirmation restoration.
 - Lossless SRT structure handling.
 - Formatting-only pipeline and all rules in Section 9.
+- Source, Subtitle-aware, All caps, and Ask always capitalization behavior,
+  including remembered and recovered effective scan choices.
 - Base, user, and universe dictionary loading.
 - Substitution loading and application.
 - Interactive prompt, valid scope matrix, and invalid-scope guidance.
@@ -451,6 +806,11 @@ Version 1 is complete when all of the following are implemented and tested:
 - User and universe maintenance.
 - Recent addition review screens.
 - Session log flushing.
+- GUI and CLI feature parity through the shared engine, with platform-appropriate
+  launch behavior and no duplicated subtitle-processing rules.
+- Ocean, Dark, and persisted editable Custom GUI themes.
+- Allowlisted Windows and universal-source release archives, matching SHA-256
+  files, required public documentation/notices, and no writable user data.
 
 ## 14. Portable Windows distribution
 
@@ -470,11 +830,120 @@ notes that disclose the executable is unsigned and may display an Unknown
 publisher warning.
 
 PyInstaller is pinned as a build-only dependency and does not change the
-single-file, standard-library-only application runtime. A Windows executable
-must be built and smoke-tested on Windows. Upgrades preserve personal data by
+standard-library-only application runtime. The frozen build uses
+`app/subtitle_gui.py` as its entry point: the Windows executable launches the
+GUI by default and accepts `--cli` to start the command-line interface. Its
+console subsystem supports the CLI; normal frozen GUI startup releases that
+console immediately. Source runs and non-Windows platforms do not use this
+console-release behavior. A Windows executable must be built and smoke-tested
+on Windows. The builder must fail before archiving if the executable does not
+report the source version, any required public file or redistribution notice is
+missing, or a known writable runtime-data path is present. Upgrades preserve personal data by
 copying `dictionaries/user`, `dictionaries/universes`, and optionally
 `dictionaries/options.ini` into a newly extracted release while the program is
 closed. The base dictionary folder is replaced by each release.
+
+## 14.1 Multi-platform source distribution
+
+The universal source ZIP runs on Windows, macOS, and Linux with Python 3.9 or
+later and Tkinter. It contains only the `app` runtime scripts, immutable base
+dictionaries and SCOWL notice, README, user guide, and MIT license. An explicit
+allowlist excludes development documents (`SPEC.md`, `STATUS.md`, and findings),
+tests, build tooling, subtitles, User and Universe dictionaries, options, theme
+preferences, recovery state, logs, backups, and prior artifacts. The release is
+accompanied by a SHA-256 checksum.
+
+Windows is the maintainer's hardware-tested platform. macOS and Linux are
+intended and covered by automated platform-routing tests, but remain explicitly
+unverified on physical systems because the maintainer does not own that
+hardware. Release documentation must preserve this distinction and must not
+claim physical validation that has not occurred.
+
+The source scripts derive writable data and the default scan root from the
+portable release root above `app`, preserving the same data layout as the
+Windows executable. `tools/build_multiplatform_release.py` must run using only
+the standard library on any supported host. It must reopen the generated ZIP,
+CRC-check its members, and compare them with the exact versioned allowlist
+before publishing the checksum. The Windows-only PyInstaller build
+remains in `tools/build_windows.ps1`, and its ZIP also includes the public
+README.
+
+## 14.2 Update progression
+
+Update support is deliberately staged so notification and verified download do
+not prematurely gain authority to replace an installation.
+
+### Stage 1 — check and verified ZIP download
+
+When **Check for updates at startup** is enabled, GUI and CLI launches make a
+short-timeout request to the public GitHub Releases API. The request itself is
+the connectivity test; the application must not depend on ping or a separate
+third-party connectivity service. Offline, rate-limited, malformed, or other
+failed checks are nonfatal and must not delay access to subtitle work beyond the
+bounded timeout.
+
+The fresh-install state is unconfirmed and must not access the network. Before
+the first check, each interface asks whether automatic startup checks are
+allowed, persists Yes or No locally, and exposes the resulting switch under
+**Menus and Display**. Declining performs no request and must remain respected
+until the user changes the option. The consent prompt must explicitly state
+that no network request has yet occurred.
+
+The shared engine compares the running semantic version with the newest
+published stable release. A newer release is reported through an interface-
+appropriate prompt. No download occurs without explicit consent. A frozen
+Windows executable offers the matching Windows architecture ZIP; every source
+launch, including source running on Windows, offers the universal source ZIP.
+Asset selection is restricted to the configured public repository and the
+project's versioned filename patterns.
+
+The user chooses where to save the ZIP. The matching `.sha256` release asset is
+mandatory, downloaded through the same shared service, and saved beside it.
+The ZIP is streamed to a sibling temporary file, subject to size limits, and
+published atomically only after its SHA-256 matches the checksum asset and any
+GitHub-provided digest. Cancellation or failure leaves the installed program
+and personal data untouched and removes partial downloads. Stage 1 does not
+extract, install, replace, restart, or delete application files.
+
+### Stage 2 — verified guided installation
+
+A later release may validate and extract the downloaded archive into a staging
+directory, explain the files and personal-data locations that will be retained,
+and guide the user through a manual installation. It must preserve User and
+Universe dictionaries, options, theme settings, recovery state, logs, and the
+portable launcher preference, and must leave the existing installation intact
+when validation fails.
+
+### Stage 3 — transactional self-update
+
+A later Windows updater may launch a helper outside the installation directory,
+exit the running application, replace the complete PyInstaller one-folder
+distribution rather than only its executable, restart the new version, and
+roll back to the prior installation if replacement or startup validation fails.
+Equivalent source-package updating must use the same staging, personal-data,
+and rollback principles. Permission failures and read-only installation
+locations must produce guidance rather than partial replacement.
+
+### `v1.1.0` publishing checklist
+
+Before publishing the GUI-capable `v1.1.0` release from `main`:
+
+1. Complete and test Stage 1 in both GUI and CLI interfaces.
+2. Change the internal version and all release-facing references from the
+   development identifier to `1.1.0`.
+3. Run Python compilation and the complete deterministic regression suite.
+4. Build fresh universal-source and Windows x64 archives from the exact release
+   commit; do not reuse dev64 artifacts after runtime changes.
+5. Verify both SHA-256 files, archive allowlists, required notices, and absence
+   of subtitles or writable personal/runtime data.
+6. Smoke-test the extracted source GUI/CLI, frozen GUI/CLI, formatting
+   preparation, and exact-byte backup restoration.
+7. Commit the validated state to `main`, tag that exact commit `v1.1.0`, and
+   publish only its matching archives/checksums with the unsigned-Windows and
+   physically-untested macOS/Linux disclosures.
+8. Create `development` from the tagged commit. Future features merge through
+   `development`; release-ready changes return to `main`, and hotfixes made on
+   `main` are merged back into `development`.
 
 ## 15. Deferred ideas
 

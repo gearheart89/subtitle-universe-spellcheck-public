@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from subtitle_cleanup import DEFAULT_OPTIONS, SubtitleCleanupTool
+from app.subtitle_cleanup import DEFAULT_OPTIONS, SubtitleCleanupTool
 
 
 def make_tool() -> SubtitleCleanupTool:
@@ -213,7 +213,7 @@ class ReviewScreenTests(unittest.TestCase):
             tool.review_recent_dictionary_additions()
 
         rendered = output.getvalue()
-        self.assertIn("User (British)", rendered)
+        self.assertIn("User (British English)", rendered)
         self.assertIn("Name", rendered)
         self.assertIn("The Doctor", rendered)
 
@@ -234,7 +234,7 @@ class ReviewScreenTests(unittest.TestCase):
             tool.review_recent_substitution_additions()
 
         rendered = output.getvalue()
-        self.assertIn("User (American)", rendered)
+        self.assertIn("User (American English)", rendered)
         self.assertIn("teh", rendered)
         self.assertIn("the", rendered)
 

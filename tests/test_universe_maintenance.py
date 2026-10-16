@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
-from subtitle_cleanup import DEFAULT_OPTIONS, SubtitleCleanupTool
+from app.subtitle_cleanup import DEFAULT_OPTIONS, SubtitleCleanupTool
 
 
 def make_tool() -> SubtitleCleanupTool:
@@ -194,6 +194,67 @@ class UniverseSpellcheckSelectionTests(unittest.TestCase):
 
 
 class UniverseLifecycleTests(unittest.TestCase):
+    def test_named_lifecycle_operations_support_gui_without_cli_prompts(self):
+        tool = make_tool()
+        tool.universe_name_exists = Mock(return_value=False)
+        tool.create_universe_files = Mock()
+        tool.copy_universe_files = Mock()
+        tool.ensure_universe_files = Mock()
+        tool.update_active_session_universe = Mock()
+        tool.active_session_uses_universe = Mock(return_value=False)
+
+        with patch.object(Path, "rename", autospec=True) as rename:
+            self.assertTrue(tool.create_universe_named("Stargate"))
+            self.assertTrue(
+                tool.duplicate_universe_named("Stargate", "Stargate Atlantis")
+            )
+            self.assertTrue(tool.rename_universe_named("Stargate", "Stargate SG-1"))
+
+        tool.create_universe_files.assert_called_once_with(
+            tool.universe_dir / "Stargate"
+        )
+        tool.copy_universe_files.assert_called_once_with(
+            tool.universe_dir / "Stargate",
+            tool.universe_dir / "Stargate Atlantis",
+        )
+        rename.assert_called_once_with(
+            tool.universe_dir / "Stargate", tool.universe_dir / "Stargate SG-1"
+        )
+
+    def test_named_lifecycle_rejects_invalid_or_duplicate_destination(self):
+        tool = make_tool()
+        tool.universe_name_exists = Mock(return_value=True)
+        tool.create_universe_files = Mock()
+        tool.copy_universe_files = Mock()
+
+        with self.assertRaisesRegex(ValueError, "cannot contain"):
+            tool.create_universe_named("Bad/Name")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            tool.create_universe_named("Stargate")
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            tool.duplicate_universe_named("Stargate", "STARGATE")
+
+        tool.create_universe_files.assert_not_called()
+        tool.copy_universe_files.assert_not_called()
+
+    def test_named_delete_honors_recovery_guard_and_exact_target(self):
+        tool = make_tool()
+        tool.active_session_uses_universe = Mock(return_value=True)
+        with patch("subtitle_cleanup.shutil.rmtree") as rmtree:
+            with self.assertRaisesRegex(ValueError, "cannot contain"):
+                tool.delete_universe_named("../Outside")
+            with self.assertRaisesRegex(RuntimeError, "interrupted spellcheck"):
+                tool.delete_universe_named("Stargate")
+            rmtree.assert_not_called()
+
+            tool.active_session_uses_universe.return_value = False
+            self.assertTrue(tool.delete_universe_named("Stargate"))
+
+        rmtree.assert_called_once_with(tool.universe_dir / "Stargate")
+        tool.log_event.assert_called_once_with(
+            {"type": "universe_delete", "universe": "Stargate"}
+        )
+
     def test_required_layout_contains_exact_runtime_files(self):
         tool = make_tool()
         root = tool.universe_dir / "Stargate"
@@ -209,6 +270,7 @@ class UniverseLifecycleTests(unittest.TestCase):
             [
                 call(root / "words.txt", "", encoding="utf-8"),
                 call(root / "names.txt", "", encoding="utf-8"),
+                call(root / "acronyms.txt", "", encoding="utf-8"),
                 call(root / "substitutions.tsv", "", encoding="utf-8"),
             ],
         )
@@ -406,11 +468,15 @@ class UniverseStatisticsAndDispatchTests(unittest.TestCase):
         tool = make_tool()
         tool.load_word_set = Mock(return_value={"alpha", "beta"})
         tool.load_name_map = Mock(return_value={"one": "One"})
+        tool.load_acronym_set = Mock(return_value={"MALP", "GDO"})
         tool.load_substitutions = Mock(return_value={"teh": "the", "recieve": "receive"})
 
         stats = tool.universe_statistics("Stargate")
 
-        self.assertEqual(stats, {"words": 2, "names": 1, "substitutions": 2})
+        self.assertEqual(
+            stats,
+            {"words": 2, "names": 1, "acronyms": 2, "substitutions": 2},
+        )
 
     def test_direct_maintenance_dispatches_to_universe_files(self):
         tool = make_tool()
@@ -420,7 +486,7 @@ class UniverseStatisticsAndDispatchTests(unittest.TestCase):
         tool.maintain_substitution_file = Mock()
         with (
             patch("subtitle_cleanup.clear_screen"),
-            patch("builtins.input", side_effect=["1", "2", "3", "0"]),
+            patch("builtins.input", side_effect=["1", "2", "3", "4", "0"]),
         ):
             tool.maintain_universe_dictionary()
 
@@ -428,6 +494,7 @@ class UniverseStatisticsAndDispatchTests(unittest.TestCase):
         self.assertEqual(tool.maintain_word_or_name_file.call_args_list, [
             call(root / "words.txt", "universe", "words", "Stargate"),
             call(root / "names.txt", "universe", "names", "Stargate"),
+            call(root / "acronyms.txt", "universe", "acronyms", "Stargate"),
         ])
         tool.maintain_substitution_file.assert_called_once_with(
             root / "substitutions.tsv", "universe", "Stargate"

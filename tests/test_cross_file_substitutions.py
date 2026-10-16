@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from subtitle_cleanup import DictionaryContext, SubtitleBlock
+from app.subtitle_cleanup import DictionaryContext, SubtitleBlock
 from tests.test_spellcheck import make_tool
 
 

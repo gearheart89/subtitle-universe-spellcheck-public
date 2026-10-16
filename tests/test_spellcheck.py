@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, PropertyMock, patch
 
-from subtitle_cleanup import (
+from app.subtitle_cleanup import (
     ConsoleProgressReporter,
     DEFAULT_OPTIONS,
     DictionaryContext,
@@ -123,7 +123,7 @@ class SpellcheckPresentationTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertRegex(rendered, r"7 - Edit/Substitute\s+Scope:")
         self.assertRegex(rendered, r"8 - Ignore\s+1 - This time")
-        self.assertRegex(rendered, r"9 - Add word/name/phrase\s+2 - This session")
+        self.assertRegex(rendered, r"9 - Add word/name/acronym/phrase\s+2 - This session")
         self.assertRegex(rendered, r"0 - Quit spellcheck\s+4 - Always")
         self.assertNotIn("3 - This universe", rendered)
         self.assertNotIn("Valid scope keys", rendered)
@@ -161,7 +161,7 @@ class SpellcheckPresentationTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertRegex(rendered, r"7 - Edit/Substitute\s+Scope:")
         self.assertRegex(rendered, r"8 - Ignore\s+1 - This time")
-        self.assertRegex(rendered, r"9 - Add word/name/phrase\s+2 - This session")
+        self.assertRegex(rendered, r"9 - Add word/name/acronym/phrase\s+2 - This session")
         self.assertRegex(rendered, r"U - Undo last action\s+3 - This universe")
         self.assertRegex(rendered, r"0 - Quit spellcheck\s+4 - Always")
 
@@ -336,6 +336,33 @@ class SpellcheckPresentationTests(unittest.TestCase):
 
 
 class InformalApostropheVariantTests(unittest.TestCase):
+    def test_internal_straight_and_curly_apostrophes_share_dictionary_identity(self):
+        straight_dictionary = DictionaryContext(
+            language="american", base_words={"don't"}
+        )
+        curly_dictionary = DictionaryContext(
+            language="american", user_words={"don’t"}
+        )
+
+        self.assertTrue(straight_dictionary.is_known_word("Don’t"))
+        self.assertTrue(curly_dictionary.is_known_word("Don't"))
+
+    def test_curly_contraction_is_skipped_without_changing_subtitle_text(self):
+        tool = make_tool()
+        block = SubtitleBlock(
+            "1",
+            "00:00:01,000 --> 00:00:04,000",
+            ["♪ Don’t go ♪"],
+        )
+        context = DictionaryContext(
+            language="american", base_words={"don't", "go"}
+        )
+
+        unknown = tool.find_first_unknown_word(block, context, "episode.srt", 0)
+
+        self.assertIsNone(unknown)
+        self.assertEqual(block.text_lines, ["♪ Don’t go ♪"])
+
     def test_option_is_enabled_by_default(self):
         self.assertTrue(DEFAULT_OPTIONS["recognize_dropped_g_apostrophe_forms"])
 
@@ -668,6 +695,44 @@ class SpellcheckActionTests(unittest.TestCase):
             result = tool.prompt_dictionary_entry("vala")
 
         self.assertEqual(result, ("names", "Vala"))
+
+    def test_dictionary_add_prompt_can_classify_an_acronym(self):
+        tool = make_tool()
+        block = SubtitleBlock("1", "00:00:01,000 --> 00:00:02,000", ["MALP"])
+
+        with patch("builtins.input", side_effect=["5", ""]):
+            result = tool.prompt_dictionary_entry("MALP", block)
+
+        self.assertEqual(result, ("acronyms", "MALP"))
+
+    def test_dictionary_add_prompt_warns_before_acronym_matching_a_word(self):
+        tool = make_tool()
+        block = SubtitleBlock("1", "00:00:01,000 --> 00:00:02,000", ["US"])
+        context = DictionaryContext(language="american", base_words={"us"})
+
+        with (
+            patch("builtins.input", side_effect=["5", "", "n", "0"]),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            result = tool.prompt_dictionary_entry("US", block, context)
+
+        self.assertIsNone(result)
+        self.assertIn("already accepted as a word", output.getvalue())
+
+    def test_dictionary_add_prompt_warns_before_word_matching_an_acronym(self):
+        tool = make_tool()
+        context = DictionaryContext(
+            language="american", user_acronyms={"XYZ"}
+        )
+
+        with (
+            patch("builtins.input", side_effect=["1", "n", "0"]),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            result = tool.prompt_dictionary_entry("xyz", context=context)
+
+        self.assertIsNone(result)
+        self.assertIn("already handled as an acronym", output.getvalue())
 
     def test_dictionary_add_can_target_universe_names(self):
         tool = make_tool()

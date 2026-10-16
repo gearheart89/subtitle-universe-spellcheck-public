@@ -2,13 +2,36 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from subtitle_cleanup import DictionaryContext, SubtitleCleanupTool
+from app.subtitle_cleanup import DEFAULT_OPTIONS, DictionaryContext, SubtitleCleanupTool
 
 
 class FormattingRegressionTests(unittest.TestCase):
     def setUp(self):
         self.tool = SubtitleCleanupTool()
         self.context = DictionaryContext(language="american")
+
+    def test_capitalization_defaults_to_ask_always(self):
+        self.assertEqual(DEFAULT_OPTIONS["capitalization_mode"], "ask_always")
+
+    def test_source_capitalization_preserves_source_case(self):
+        self.tool.options["capitalization_mode"] = "source"
+        result = self.tool.format_text_lines(
+            ["i'M READY, MALP."],
+            DictionaryContext(language="american", acronym_set={"MALP"}),
+        )
+        self.assertEqual(result, ["i'M READY, MALP."])
+
+    def test_subtitle_aware_capitalization_uses_existing_repairs(self):
+        self.tool.options["capitalization_mode"] = "subtitle"
+        result = self.tool.format_text_lines(["i think i'm ready."], self.context)
+        self.assertEqual(result, ["I think I'm ready."])
+
+    def test_all_caps_uppercases_visible_text_without_changing_tags(self):
+        self.tool.options["capitalization_mode"] = "all_caps"
+        result = self.tool.format_text_lines(
+            ["<i>I'm ready, Colonel.</i>"], self.context
+        )
+        self.assertEqual(result, ["<i>I'M READY, COLONEL.</i>"])
 
     def test_v023_balances_and_lowercases_standalone_article(self):
         result = self.tool.format_text_lines(
@@ -116,6 +139,8 @@ class FormattingRegressionTests(unittest.TestCase):
         self.assertEqual(result, ["I am ready at 4:00 AM."])
 
     def test_possessive_acronym_preserves_authoritative_casing(self):
+        self.context.universe_acronyms.add("SGC")
+        self.context.acronym_set.add("SGC")
         result = self.tool.format_text_lines(
             ["THE SGC'S TEAM IS READY."],
             self.context,
@@ -127,7 +152,9 @@ class FormattingRegressionTests(unittest.TestCase):
         context = DictionaryContext(
             language="american",
             universe_names={"nid": "NID"},
+            universe_acronyms={"SGC"},
         )
+        context.acronym_set.update(context.universe_acronyms)
 
         result = self.tool.normalize_dotted_acronyms(
             "Meet at 4:00 a.m., i.e., near the U.S. S.G.C. or N.I.D. office.",
@@ -181,6 +208,20 @@ class FormattingRegressionTests(unittest.TestCase):
 
         self.assertTrue(context.is_known_word("MALPs"))
         self.assertTrue(context.is_known_word("GDO's"))
+
+    def test_explicit_universe_acronyms_restore_casing_and_inflections(self):
+        context = DictionaryContext(
+            language="american",
+            universe="Stargate SG-1",
+            universe_acronyms={"MALP", "GDO", "SGC"},
+        )
+        context.acronym_set.update(context.universe_acronyms)
+
+        result = self.tool.format_text_lines(
+            ["Send the malp and gdos to the s.g.c."], context
+        )
+
+        self.assertEqual(result, ["Send the MALP and GDOs to the SGC."])
 
     def test_uppercase_repair_runs_before_dropped_speaker_detection(self):
         order = []
@@ -303,6 +344,43 @@ class FormattingRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual(result, ["- No, I'm not.", "- Yes, you are"])
+
+    def test_lowercase_pronoun_i_is_repaired_in_mixed_case_dialogue(self):
+        self.tool.options["adjust_subtitle_line_count"] = False
+        self.tool.options["detect_dropped_speaker_breaks"] = False
+
+        result = self.tool.format_text_lines(
+            ['Was that "i told you so," colonel? i\'m sure i’d remember.'],
+            self.context,
+        )
+
+        self.assertEqual(
+            result,
+            ['Was that "I told you so," colonel? I\'m sure I’d remember.'],
+        )
+
+    def test_pronoun_i_repair_preserves_tags_abbreviations_and_urls(self):
+        self.tool.options["adjust_subtitle_line_count"] = False
+        self.tool.options["detect_dropped_speaker_breaks"] = False
+
+        result = self.tool.format_text_lines(
+            ["<i>i said i'd check i.e. https://example.test/i/help.</i>"],
+            self.context,
+        )
+
+        self.assertEqual(
+            result,
+            ["<i>I said I'd check i.e. https://example.test/i/help.</i>"],
+        )
+
+    def test_lowercase_pronoun_i_repair_can_be_disabled(self):
+        self.tool.options["capitalize_lowercase_pronoun_i"] = False
+        self.tool.options["adjust_subtitle_line_count"] = False
+        self.tool.options["detect_dropped_speaker_breaks"] = False
+
+        result = self.tool.format_text_lines(["i think i'm ready."], self.context)
+
+        self.assertEqual(result, ["i think i'm ready."])
 
     def test_dropped_speaker_detection_ignores_ellipses(self):
         self.assertEqual(

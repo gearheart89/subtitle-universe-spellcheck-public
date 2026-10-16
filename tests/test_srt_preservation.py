@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
-from subtitle_cleanup import DictionaryContext, replace_first_word_in_lines
+from app.subtitle_cleanup import DictionaryContext, replace_first_word_in_lines
 from tests.test_spellcheck import make_tool
 
 

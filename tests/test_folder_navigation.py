@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
-from subtitle_cleanup import DEFAULT_OPTIONS, SubtitleCleanupTool
+from app.subtitle_cleanup import DEFAULT_OPTIONS, SubtitleCleanupTool
 
 
 def make_tool(script_dir: Path) -> SubtitleCleanupTool:

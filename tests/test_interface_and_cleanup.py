@@ -3,7 +3,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from subtitle_cleanup import DictionaryContext, SubtitleBlock, SubtitleCleanupTool
+from app.subtitle_cleanup import (
+    PROJECT_URL,
+    SCOWL_CREDIT,
+    SCOWL_URL,
+    DictionaryContext,
+    SubtitleBlock,
+    SubtitleCleanupTool,
+)
 
 
 class InterfaceGroupingTests(unittest.TestCase):
@@ -25,6 +32,24 @@ class InterfaceGroupingTests(unittest.TestCase):
         self.assertIn("3. Run spellcheck with optional universe dictionary", rendered)
         self.assertIn("11. Flush session log", rendered)
 
+    def test_cli_about_includes_project_license_and_scowl_attribution(self):
+        tool = SubtitleCleanupTool()
+        output = io.StringIO()
+
+        with (
+            patch("app.subtitle_cleanup.clear_screen"),
+            patch("builtins.input", return_value=""),
+            patch("sys.stdout", output),
+        ):
+            tool.show_about_screen()
+
+        rendered = output.getvalue()
+        self.assertIn(PROJECT_URL, rendered)
+        self.assertIn("Application source: MIT License", rendered)
+        self.assertIn(SCOWL_CREDIT, rendered)
+        self.assertIn(SCOWL_URL, rendered)
+        self.assertIn("dictionaries/base/SCOWL-COPYRIGHT.txt", rendered)
+
     def test_options_use_category_submenus_with_inline_cleanup_examples(self):
         tool = SubtitleCleanupTool()
         output = io.StringIO()
@@ -43,6 +68,33 @@ class InterfaceGroupingTests(unittest.TestCase):
         self.assertIn("[â€™ → ’] [â€œ → “]", rendered)
         self.assertIn("[<i>Hello<i> → <i>Hello</i>]", rendered)
         self.assertIn("[reports only—does not edit]", rendered)
+
+    def test_main_menu_flush_help_explains_scope_without_flushing(self):
+        tool = SubtitleCleanupTool()
+        log_path = Path(__file__).with_name("_main_menu_flush_help.jsonl")
+        try:
+            log_path.write_text('{"event": "dictionary_add"}\n', encoding="utf-8")
+            tool.session_log_path = log_path
+            output = io.StringIO()
+
+            with (
+                patch("subtitle_cleanup.clear_screen"),
+                patch("subtitle_cleanup.pause"),
+                patch("builtins.input", side_effect=["11?", "0"]),
+                patch("sys.stdout", output),
+            ):
+                tool.run()
+
+            rendered = output.getvalue()
+            self.assertIn("Flush session log — Help", rendered)
+            self.assertIn("does not remove dictionary entries", rendered)
+            self.assertIn("does not clear or abandon", rendered)
+            self.assertEqual(
+                log_path.read_text(encoding="utf-8"),
+                '{"event": "dictionary_add"}\n',
+            )
+        finally:
+            log_path.unlink(missing_ok=True)
 
 
 class CommonErrorCleanupTests(unittest.TestCase):
