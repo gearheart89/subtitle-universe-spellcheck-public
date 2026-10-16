@@ -134,6 +134,9 @@ class UpdateTests(unittest.TestCase):
         self.assertTrue(is_newer_version("1.0.0", "1.0.0-rc4-dev64"))
         self.assertFalse(is_newer_version("1.0.0-rc3", "1.0.0-rc4-dev64"))
         self.assertFalse(is_newer_version("1.1.0", "1.1.0"))
+        self.assertTrue(is_newer_version("1.1.1-test1", "1.1.1-test0"))
+        self.assertTrue(is_newer_version("1.1.1", "1.1.1-test1"))
+        self.assertFalse(is_newer_version("1.1.1-test0", "1.1.1-test1"))
 
     def test_update_check_selects_source_asset_for_source_launch(self):
         payload = zip_bytes()
@@ -283,7 +286,7 @@ class UpdateTests(unittest.TestCase):
                 Path(str(destination) + ".sha256"),
             )
             with (
-                patch("builtins.input", side_effect=["y", str(destination)]),
+                patch("builtins.input", side_effect=["y", str(destination), "n"]),
                 patch("sys.stdout", new_callable=io.StringIO) as output,
             ):
                 tool.check_for_updates_cli()
@@ -291,6 +294,31 @@ class UpdateTests(unittest.TestCase):
         tool.download_update.assert_called_once_with(update, destination)
         self.assertIn("Version 1.1.0 is available", output.getvalue())
         self.assertIn("Downloaded and verified", output.getvalue())
+
+    def test_cli_verified_download_can_launch_transactional_installer(self):
+        tool = SubtitleCleanupTool()
+        tool.update_check_preference_confirmed = True
+        tool.options["check_for_updates_at_startup"] = True
+        update = Mock(version="2.0.0", name="Release", page_url="https://github.com/release")
+        update.asset.name = "SubtitleUniverseSpellcheck-2.0.0-source.zip"
+        archive = Path("C:/Downloads") / update.asset.name
+        prepared = Mock()
+        tool.check_for_update = Mock(return_value=update)
+        tool.download_update = Mock(return_value=(archive, Path(str(archive) + ".sha256")))
+        tool.prepare_update_installation = Mock(return_value=prepared)
+        tool.launch_prepared_update = Mock()
+
+        with (
+            patch("builtins.input", side_effect=["y", str(archive), "yes"]),
+            patch("sys.stdout", new_callable=io.StringIO),
+        ):
+            launched = tool.check_for_updates_cli()
+
+        self.assertTrue(launched)
+        tool.prepare_update_installation.assert_called_once_with(
+            update, archive, interface="cli"
+        )
+        tool.launch_prepared_update.assert_called_once_with(prepared)
 
     def test_gui_update_offer_uses_selected_release_asset(self):
         gui = SubtitleSpellcheckGUI.__new__(SubtitleSpellcheckGUI)
@@ -316,6 +344,19 @@ class UpdateTests(unittest.TestCase):
         gui._start_update_download.assert_called_once_with(
             update, Path("C:/Downloads") / update.asset.name
         )
+
+    def test_gui_cannot_close_midway_through_update_preparation(self):
+        gui = SubtitleSpellcheckGUI.__new__(SubtitleSpellcheckGUI)
+        gui.update_installing = True
+        gui.messagebox = Mock()
+        gui.root = Mock()
+        gui._confirm_theme_navigation = Mock()
+
+        gui._close_window()
+
+        gui.messagebox.showinfo.assert_called_once()
+        gui.root.destroy.assert_not_called()
+        gui._confirm_theme_navigation.assert_not_called()
 
     def test_windows_builder_keeps_tls_support_for_update_downloads(self):
         builder = (Path(__file__).resolve().parents[1] / "tools" / "build_windows.ps1").read_text(

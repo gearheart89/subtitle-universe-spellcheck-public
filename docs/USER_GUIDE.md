@@ -44,9 +44,20 @@ and are not yet written to disk.
 Use **Pause scan** during background work to retain progress, or **Stop scan**
 to discard only the GUI's in-memory review. They are separate buttons; Pause
 never doubles as Stop. A displayed unknown is already a
-natural pause while the program waits for your choice. Some Linux
-distributions require a separate Tkinter package such as `python3-tk` or
-`python3-tkinter`.
+natural pause while the program waits for your choice.
+
+Official Windows Python installers and the frozen Windows release already
+include the GUI support they need, so they do not run a Tkinter check. A source
+launch on Linux or macOS checks Tkinter only when a GUI launch may be needed.
+If it is missing, choose **Yes** to try the recognized operating-system package
+manager, **No** to use CLI for this launch, or **Stop asking** to remember CLI
+fallback in `dictionaries/options.ini`. Stop asking bypasses the normal
+interface chooser while Tkinter remains absent. To retry later, open CLI
+**Options → Install/check Tkinter GUI support**; that action appears only after
+Stop asking was selected. An explicit `--cli` launch and an already saved CLI
+launcher preference never require Tkinter. If the application cannot recognize
+the package manager, it links to the official Python Tkinter documentation and
+suggests `python -m tkinter` to verify a manual installation.
 
 Root-level `SubtitleUniverseSpellcheck.pyw` chooses between the two interfaces.
 On first use, enter `1` for GUI or `2` for CLI; invalid input is rejected. The
@@ -73,6 +84,10 @@ SHA-256 file before extracting it. Double-clicking the executable opens the
 GUI without keeping a console window open. To use the CLI from the same
 package, open a terminal in the extracted folder and run
 `SubtitleUniverseSpellcheck.exe --cli`.
+
+The executable and application window use the same project quill icon. Source
+packages retain the PNG/ICO pair under `assets`; keep that folder with the
+application when moving or updating it.
 
 Open **Options menu → File Discovery and Safety** and enable ZIP backups before
 editing irreplaceable subtitles. Backups contain only `.srt` files and are
@@ -224,8 +239,16 @@ option can change that answer later. The check is short and nonfatal when
 offline. A newer stable release is never downloaded without confirmation. Windows executable launches
 offer the matching Windows ZIP; all source launches offer the universal source
 ZIP. The program verifies the required `.sha256` file and ZIP before publishing
-both at the destination you select. It does not install the download or replace
-the running copy.
+both at the destination you select. You can then keep the verified ZIP or
+approve automatic installation. Automatic installation stages the complete
+new distribution outside the running folder, preserves portable dictionaries,
+options, theme and recovery data, logs, launcher preference, and any subtitles
+or backup archives beneath the application folder, then closes the old version.
+An external helper exchanges the distribution, checks the new version, restarts
+the same GUI or CLI interface, and rolls back if validation fails. The restarted
+launcher removes temporary updater files; if Windows still has the helper
+locked, cleanup is recorded and retried on the next launch. Git working copies
+must be updated with Git rather than the automatic installer.
 
 The original GUI color design is named **Ocean** and is the fresh-install
 default. Select **Themes** under Settings to choose Ocean, the built-in **Dark**

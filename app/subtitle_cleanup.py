@@ -12,11 +12,13 @@ import configparser
 import difflib
 import gzip
 import hashlib
+import importlib
 import io
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -32,9 +34,10 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.1.1"
 SCHEMA_VERSION = 1
 PROJECT_URL = "https://github.com/gearheart89/subtitle-universe-spellcheck-public"
+TKINTER_DOCS_URL = "https://docs.python.org/3/library/tkinter.html"
 UPDATE_API_URL = "https://api.github.com/repos/gearheart89/subtitle-universe-spellcheck-public/releases/latest"
 UPDATE_TIMEOUT_SECONDS = 4.0
 UPDATE_METADATA_LIMIT = 2 * 1024 * 1024
@@ -63,6 +66,113 @@ SESSION_LOG_HELP = (
     "It also does not clear or abandon an interrupted spellcheck session, "
     "including CLI and GUI recovery."
 )
+
+
+def tkinter_preflight_required(
+    *,
+    platform_name: Optional[str] = None,
+    frozen: Optional[bool] = None,
+) -> bool:
+    """Return whether a source launch should verify optional Tkinter support.
+
+    Official Windows Python installers bundle Tcl/Tk, and a frozen release is
+    built with the GUI runtime under our control.  Only source launches on
+    Linux and macOS need this recovery path.
+    """
+    current_platform = platform_name if platform_name is not None else sys.platform
+    is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    return not is_frozen and current_platform in {"linux", "darwin"}
+
+
+def tkinter_is_available(
+    importer: Callable[[str], object] = importlib.import_module,
+) -> bool:
+    """Check both Python's wrapper and its compiled Tcl/Tk extension."""
+    try:
+        importer("tkinter")
+        importer("_tkinter")
+    except (ImportError, ModuleNotFoundError):
+        return False
+    return True
+
+
+def tkinter_install_command(
+    *,
+    platform_name: Optional[str] = None,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    is_root: Optional[bool] = None,
+    python_version: Optional[Tuple[int, int]] = None,
+) -> Optional[List[str]]:
+    """Return a conservative package-manager command for Tkinter, if known."""
+    current_platform = platform_name if platform_name is not None else sys.platform
+    if current_platform == "darwin":
+        brew = which("brew")
+        if not brew:
+            return None
+        major, minor = python_version or (sys.version_info.major, sys.version_info.minor)
+        return [brew, "install", f"python-tk@{major}.{minor}"]
+    if current_platform != "linux":
+        return None
+
+    if is_root is None:
+        try:
+            is_root = os.geteuid() == 0
+        except AttributeError:
+            is_root = False
+    prefix: List[str] = []
+    if not is_root:
+        sudo = which("sudo")
+        if not sudo:
+            return None
+        prefix = [sudo]
+
+    package_managers = (
+        ("apt-get", ["install", "-y", "python3-tk"]),
+        ("dnf", ["install", "-y", "python3-tkinter"]),
+        ("pacman", ["-S", "--needed", "--noconfirm", "tk"]),
+        ("apk", ["add", "py3-tkinter"]),
+    )
+    for executable, arguments in package_managers:
+        resolved = which(executable)
+        if resolved:
+            return prefix + [resolved, *arguments]
+    return None
+
+
+def install_tkinter_support(
+    *,
+    platform_name: Optional[str] = None,
+    runner: Callable[..., object] = subprocess.run,
+    output_stream=None,
+) -> bool:
+    """Run a recognized OS package command after the user's explicit consent."""
+    output_stream = output_stream if output_stream is not None else sys.stdout
+    command = tkinter_install_command(platform_name=platform_name)
+    if command is None:
+        print(
+            "No supported package manager was detected. Install Tkinter for this "
+            "Python interpreter using your operating system's package manager, "
+            "then launch the program again.\n\n"
+            f"Official Tkinter documentation: {TKINTER_DOCS_URL}\n"
+            "After installation, run `python -m tkinter` to verify GUI support "
+            "(replace `python` with the command for this interpreter if needed).",
+            file=output_stream,
+        )
+        return False
+    print("Running: " + " ".join(command), file=output_stream)
+    try:
+        completed = runner(command, check=False)
+    except OSError as error:
+        print(f"Tkinter installation could not start: {error}", file=output_stream)
+        return False
+    if getattr(completed, "returncode", 1) != 0:
+        print(
+            "The package manager did not complete successfully. The CLI will start "
+            "and the existing installation remains unchanged.",
+            file=output_stream,
+        )
+        return False
+    return True
 
 BASE_LANGUAGE_CHOICES = {"1": "american", "2": "british"}
 LOWERCASE_WORDS = {
@@ -181,7 +291,7 @@ OPTION_LABELS = {
 }
 
 OPTION_DESCRIPTIONS = {
-    "check_for_updates_at_startup": "When enabled, launch performs a short, nonfatal check of the public GitHub release page. A newer version is never downloaded without permission, and Stage 1 never installs or replaces application files.",
+    "check_for_updates_at_startup": "When enabled, launch performs a short, nonfatal check of the public GitHub release page. A newer version is never downloaded or installed without permission. Verified updates can be kept as ZIP files or installed transactionally with validation, restart, and rollback protection.",
     "capitalization_mode": "Ask always prompts at the start of each new scan but not when resuming one already in progress. Source capitalization preserves the capitalization in the subtitle. Subtitle-aware capitalization applies the tool's conservative pronoun, sound-effect, name, acronym, and mostly-uppercase repairs. All caps changes all visible subtitle text to uppercase while preserving markup tags.",
     "scan_folders_recursively": "When enabled, the selected folder and every child folder are scanned for .srt files. When disabled, only .srt files directly inside the selected folder are scanned.",
     "recognize_dropped_g_apostrophe_forms": "When enabled, informal dialogue forms ending in -in' or -in’ are accepted when adding g produces a known -ing word. For example, goin' is recognized only when going is in the active dictionaries.",
@@ -766,6 +876,16 @@ class ReleaseUpdate:
     checksum_asset: ReleaseAsset
 
 
+@dataclass(frozen=True)
+class PreparedUpdate:
+    """A verified update staged outside the active installation."""
+
+    plan_path: Path
+    helper_command: Tuple[str, ...]
+    archive_digest: str
+    cleanup_paths: Tuple[Path, ...]
+
+
 def _version_parts(value: str) -> Tuple[Tuple[int, ...], Tuple[Tuple[int, object], ...]]:
     """Return comparable numeric and prerelease components for project versions."""
     match = re.fullmatch(r"v?(\d+(?:\.\d+)*)(?:[-+](.+))?", value.strip(), re.IGNORECASE)
@@ -835,6 +955,7 @@ class SubtitleCleanupTool:
         self.session_log_path = self.dict_dir / "session_log.jsonl"
         self.options: Dict[str, object] = dict(DEFAULT_OPTIONS)
         self.update_check_preference_confirmed = False
+        self.suppress_tkinter_startup_prompt = False
         self.undo_stack: List[dict] = []
         self.current_session_ignores: set = set()
         self.current_session_substitutions: Dict[str, str] = {}
@@ -873,6 +994,9 @@ class SubtitleCleanupTool:
         self.update_check_preference_confirmed = parser.getboolean(
             "options", "update_check_preference_confirmed", fallback=False
         )
+        self.suppress_tkinter_startup_prompt = parser.getboolean(
+            "options", "suppress_tkinter_startup_prompt", fallback=False
+        )
         loaded = dict(DEFAULT_OPTIONS)
         if parser.has_section("options"):
             for key, default in DEFAULT_OPTIONS.items():
@@ -900,10 +1024,25 @@ class SubtitleCleanupTool:
         parser["options"]["update_check_preference_confirmed"] = str(
             getattr(self, "update_check_preference_confirmed", False)
         )
+        parser["options"]["suppress_tkinter_startup_prompt"] = str(
+            getattr(self, "suppress_tkinter_startup_prompt", False)
+        )
         self.dict_dir.mkdir(parents=True, exist_ok=True)
         output = io.StringIO()
         parser.write(output)
         self.atomic_write_text(self.options_path, output.getvalue())
+
+    def set_tkinter_startup_prompt_suppressed(self, suppressed: bool) -> None:
+        """Persist the source-launch Tkinter prompt preference atomically."""
+        if not isinstance(suppressed, bool):
+            raise ValueError("The Tkinter prompt preference must be true or false.")
+        previous = getattr(self, "suppress_tkinter_startup_prompt", False)
+        self.suppress_tkinter_startup_prompt = suppressed
+        try:
+            self.save_options()
+        except Exception:
+            self.suppress_tkinter_startup_prompt = previous
+            raise
 
     def set_option_value(
         self,
@@ -1138,8 +1277,185 @@ class SubtitleCleanupTool:
                 except FileNotFoundError:
                     pass
 
-    def check_for_updates_cli(self) -> None:
-        """Offer a verified ZIP download at CLI startup; failures remain nonfatal."""
+    def _verify_local_update_archive(self, archive_path: Path) -> str:
+        """Recheck a downloaded archive and its companion checksum before staging."""
+        archive_path = Path(archive_path).resolve()
+        checksum_path = Path(str(archive_path) + ".sha256")
+        try:
+            checksum_text = checksum_path.read_text(encoding="ascii")
+            match = re.search(r"(?i)(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])", checksum_text)
+            if match is None:
+                raise UpdateError("The saved update checksum is invalid.")
+            expected = match.group(1).casefold()
+            digest = hashlib.sha256()
+            with archive_path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            actual = digest.hexdigest().casefold()
+            if actual != expected:
+                raise UpdateError("The saved update archive failed its checksum verification.")
+            with zipfile.ZipFile(archive_path) as archive:
+                members = archive.infolist()
+                if not members or archive.testzip() is not None:
+                    raise UpdateError("The saved update ZIP is damaged.")
+                roots = set()
+                for member in members:
+                    path = PurePosixPath(member.filename.replace("\\", "/"))
+                    if path.is_absolute() or ".." in path.parts or not path.parts:
+                        raise UpdateError("The saved update ZIP contains an unsafe path.")
+                    roots.add(path.parts[0])
+                    if (member.external_attr >> 16) & 0o170000 == 0o120000:
+                        raise UpdateError("The saved update ZIP contains an unsupported link.")
+                if len(roots) != 1:
+                    raise UpdateError("The saved update ZIP must contain one application folder.")
+        except UpdateError:
+            raise
+        except (OSError, UnicodeError, zipfile.BadZipFile) as error:
+            raise UpdateError("The saved update ZIP could not be verified.") from error
+        return actual
+
+    def prepare_update_installation(
+        self,
+        update: ReleaseUpdate,
+        archive_path: Path,
+        *,
+        interface: str,
+        frozen: Optional[bool] = None,
+        executable: Optional[str] = None,
+        staging_parent: Optional[Path] = None,
+        helper_parent: Optional[Path] = None,
+        process_id: Optional[int] = None,
+    ) -> PreparedUpdate:
+        """Validate and stage an update transaction without changing the installation."""
+        if interface not in {"gui", "cli"}:
+            raise ValueError("The update interface must be gui or cli.")
+        archive_path = Path(archive_path).resolve()
+        digest = self._verify_local_update_archive(archive_path)
+        installation = Path(self.script_dir).resolve()
+        if (installation / ".git").exists():
+            raise UpdateError(
+                "Automatic installation is disabled for a Git working copy. "
+                "Update that checkout with Git instead."
+            )
+        is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+
+        stage_base = Path(staging_parent).resolve() if staging_parent else installation.parent
+        helper_base = Path(helper_parent).resolve() if helper_parent else installation.parent
+        stage_base.mkdir(parents=True, exist_ok=True)
+        helper_base.mkdir(parents=True, exist_ok=True)
+        stage_root = Path(tempfile.mkdtemp(prefix=".subtitle-universe-update-stage-", dir=stage_base))
+        helper_root = Path(tempfile.mkdtemp(prefix=".subtitle-universe-update-helper-", dir=helper_base))
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                archive.extractall(stage_root)
+                first_member = PurePosixPath(archive.infolist()[0].filename.replace("\\", "/"))
+                payload = stage_root / first_member.parts[0]
+            if is_frozen:
+                main_entry = payload / "SubtitleUniverseSpellcheck.exe"
+                packaged_helper = payload / "SubtitleUniverseUpdater.exe"
+                helper_copy = helper_root / packaged_helper.name
+                if not main_entry.is_file() or not packaged_helper.is_file():
+                    raise UpdateError("The staged Windows update is missing an executable.")
+                shutil.copy2(packaged_helper, helper_copy)
+                helper_command = (str(helper_copy), str(helper_root / "update-plan.json"))
+                health_command = [str(installation / main_entry.name), "--version"]
+                restart_base = [str(installation / main_entry.name)]
+            else:
+                main_entry = payload / "app" / "subtitle_gui.py"
+                packaged_helper = payload / "app" / "update_helper.py"
+                helper_copy = helper_root / "update_helper.py"
+                if not (payload / "SubtitleUniverseSpellcheck.pyw").is_file() or not main_entry.is_file() or not packaged_helper.is_file():
+                    raise UpdateError("The staged source update is missing required program files.")
+                shutil.copy2(packaged_helper, helper_copy)
+                python = executable or sys.executable
+                health_python = python
+                if Path(python).name.casefold() == "pythonw.exe":
+                    health_python = str(Path(python).with_name("python.exe"))
+                helper_command = (str(python), str(helper_copy), str(helper_root / "update-plan.json"))
+                health_command = [health_python, str(installation / "app" / "subtitle_gui.py"), "--version"]
+                restart_base = [str(python), str(installation / "app" / "subtitle_gui.py")]
+
+            cleanup_arguments = ["--update-cleanup", str(helper_root)]
+            restart_command = restart_base + cleanup_arguments
+            rollback_command = list(restart_base)
+            if interface == "cli":
+                restart_command.append("--cli")
+                rollback_command.append("--cli")
+
+            preserved = [
+                Path("dictionaries/user"),
+                Path("dictionaries/universes"),
+                Path("dictionaries/options.ini"),
+                Path("dictionaries/gui_theme.json"),
+                Path("dictionaries/session_state.json"),
+                Path("dictionaries/gui_session_state.json.gz"),
+                Path("dictionaries/session_log.jsonl"),
+                Path("dictionaries/pending_update_cleanup.json"),
+                Path("launch gui.txt"),
+                Path("launch cli.txt"),
+            ]
+            for candidate in installation.rglob("*"):
+                if candidate.is_file() and (
+                    candidate.suffix.casefold() == ".srt"
+                    or candidate.name.casefold() == "backup_subtitles.zip"
+                ):
+                    relative = candidate.relative_to(installation)
+                    if relative not in preserved:
+                        preserved.append(relative)
+
+            backup = installation.with_name(installation.name + ".previous-version")
+            plan = {
+                "schema": 1,
+                "installation_root": str(installation),
+                "payload_root": str(payload.resolve()),
+                "backup_root": str(backup),
+                "wait_for_pid": os.getpid() if process_id is None else int(process_id),
+                "health_check_command": health_command,
+                "expected_health_output": f"Subtitle Universe Spellcheck {update.version}",
+                "restart_command": restart_command,
+                "rollback_restart_command": rollback_command,
+                "preserve_paths": [path.as_posix() for path in preserved],
+                "remove_after_success": [str(stage_root)],
+            }
+            plan_path = helper_root / "update-plan.json"
+            plan_path.write_text(json.dumps(plan, indent=2), encoding="utf-8")
+            return PreparedUpdate(
+                plan_path,
+                tuple(helper_command),
+                digest,
+                (helper_root, stage_root),
+            )
+        except Exception:
+            shutil.rmtree(stage_root, ignore_errors=True)
+            shutil.rmtree(helper_root, ignore_errors=True)
+            raise
+
+    def launch_prepared_update(
+        self,
+        prepared: PreparedUpdate,
+        *,
+        process_launcher: Callable[..., object] = subprocess.Popen,
+    ) -> object:
+        """Start the external updater; the caller should then close normally."""
+        options: Dict[str, object] = {"close_fds": True}
+        if os.name == "nt":
+            options["creationflags"] = 0x00000008
+        else:
+            options.update(
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        try:
+            return process_launcher(list(prepared.helper_command), **options)
+        except OSError as error:
+            for cleanup_path in prepared.cleanup_paths:
+                shutil.rmtree(cleanup_path, ignore_errors=True)
+            raise UpdateError("The external updater could not be started.") from error
+
+    def check_for_updates_cli(self) -> bool:
+        """Offer a verified update at CLI startup; return true when updater launched."""
         if not getattr(self, "update_check_preference_confirmed", False):
             print(
                 "\nSubtitle Universe Spellcheck can check the public GitHub Releases "
@@ -1154,20 +1470,20 @@ class SubtitleCleanupTool:
                 self.set_option_value("check_for_updates_at_startup", enabled)
             except OSError as error:
                 print(f"The update-check preference could not be saved: {error}")
-                return
+                return False
         if not self.options.get("check_for_updates_at_startup", False):
-            return
+            return False
         try:
             update = self.check_for_update()
         except UpdateError:
-            return
+            return False
         if update is None:
-            return
+            return False
         print(f"\nVersion {update.version} is available: {update.name}")
         print(update.page_url)
-        print("Stage 1 downloads a verified ZIP only; it does not install or replace files.")
+        print("The ZIP is verified before any installation is attempted.")
         if input("Download this update ZIP now? [y/N]: ").strip().casefold() not in {"y", "yes"}:
-            return
+            return False
         default_directory = Path.home() / "Downloads"
         if not default_directory.is_dir():
             default_directory = self.script_dir
@@ -1178,9 +1494,26 @@ class SubtitleCleanupTool:
             archive_path, checksum_path = self.download_update(update, destination)
         except UpdateError as error:
             print(f"Update download failed: {error}")
-            return
+            return False
         print(f"Downloaded and verified: {archive_path}")
         print(f"Checksum: {checksum_path}")
+        if input("Install it now and restart automatically? [y/N]: ").strip().casefold() not in {
+            "y",
+            "yes",
+        }:
+            return False
+        try:
+            prepared = self.prepare_update_installation(
+                update,
+                archive_path,
+                interface="cli",
+            )
+            self.launch_prepared_update(prepared)
+        except (OSError, RuntimeError, UpdateError, ValueError, zipfile.BadZipFile) as error:
+            print(f"Automatic installation could not start: {error}")
+            return False
+        print("The updater is ready. Closing this version so it can be replaced...")
+        return True
 
     # ------------------------------------------------------------------
     # Logs / state
@@ -1333,17 +1666,53 @@ class SubtitleCleanupTool:
             print("Options\n")
             for index, (title, _) in enumerate(OPTION_GROUPS, start=1):
                 print(f"{index}. {title}")
+            show_tkinter_retry = bool(
+                getattr(self, "suppress_tkinter_startup_prompt", False)
+                and tkinter_preflight_required()
+            )
+            tkinter_index = len(OPTION_GROUPS) + 1
+            if show_tkinter_retry:
+                print(f"{tkinter_index}. Install/check Tkinter GUI support")
             print("\n0. Back to main menu")
             raw = input("\nCategory: ").strip()
             if raw == "0":
                 self.save_options()
                 return
+            if show_tkinter_retry and raw == str(tkinter_index):
+                self.configure_tkinter_support_cli()
+                continue
             if not raw.isdigit() or not (1 <= int(raw) <= len(OPTION_GROUPS)):
                 print("Unexpected input. Enter a listed category number.")
                 pause()
                 continue
             title, keys = OPTION_GROUPS[int(raw) - 1]
             self.option_group_menu(title, keys)
+
+    def configure_tkinter_support_cli(self) -> None:
+        """Retry optional GUI support after the user previously chose Stop asking."""
+        clear_screen()
+        print("Tkinter GUI support\n")
+        if tkinter_is_available():
+            self.set_tkinter_startup_prompt_suppressed(False)
+            print("Tkinter is already available. The GUI can be selected next launch.")
+            pause()
+            return
+        print(
+            "Tkinter is not available for this Python interpreter. The application "
+            "can ask a recognized operating-system package manager to install it."
+        )
+        choice = input("\nInstall Tkinter now? [y/N]: ").strip().casefold()
+        if choice not in {"y", "yes"}:
+            return
+        if install_tkinter_support() and tkinter_is_available():
+            self.set_tkinter_startup_prompt_suppressed(False)
+            print("Tkinter GUI support is ready. You can select the GUI next launch.")
+        else:
+            print(
+                "Tkinter is still unavailable. The startup question remains disabled; "
+                "you can retry this option later."
+            )
+        pause()
 
     def option_group_menu(self, title: str, keys: Sequence[str]) -> None:
         display_labels = [
@@ -7596,7 +7965,8 @@ def count_nonblank_lines(path: Path) -> int:
 def main() -> None:
     try:
         tool = SubtitleCleanupTool()
-        tool.check_for_updates_cli()
+        if tool.check_for_updates_cli():
+            return
         tool.run()
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

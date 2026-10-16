@@ -29,12 +29,18 @@ try {
     $artifactBaseName = "$distributionName-$version-windows-$architecture"
     $zipPath = Join-Path $artifactFolder "$artifactBaseName.zip"
     $checksumPath = "$zipPath.sha256"
+    $iconPath = Join-Path $projectRoot "assets\subtitle-universe-quill.ico"
+    $iconPngPath = Join-Path $projectRoot "assets\subtitle-universe-quill.png"
+    if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf) -or -not (Test-Path -LiteralPath $iconPngPath -PathType Leaf)) {
+        throw "The project quill icon assets are missing."
+    }
 
     & $PythonExecutable -m PyInstaller `
         --noconfirm `
         --clean `
         --onedir `
         --console `
+        --icon $iconPath `
         --paths (Join-Path $projectRoot "app") `
         --name $distributionName `
         --distpath (Join-Path $projectRoot "dist") `
@@ -45,10 +51,28 @@ try {
         throw "PyInstaller failed."
     }
 
+    $updaterBuildFolder = Join-Path $projectRoot "build\updater-dist"
+    & $PythonExecutable -m PyInstaller `
+        --noconfirm `
+        --clean `
+        --onefile `
+        --console `
+        --name "SubtitleUniverseUpdater" `
+        --distpath $updaterBuildFolder `
+        --workpath (Join-Path $projectRoot "build\updater-work") `
+        --specpath (Join-Path $projectRoot "build") `
+        (Join-Path $projectRoot "app\update_helper.py")
+    if ($LASTEXITCODE -ne 0) {
+        throw "PyInstaller failed while building the external updater."
+    }
+    Copy-Item -LiteralPath (Join-Path $updaterBuildFolder "SubtitleUniverseUpdater.exe") -Destination $distributionFolder
+
     $baseDestination = Join-Path $distributionFolder "dictionaries\base"
+    $assetsDestination = Join-Path $distributionFolder "assets"
     $docsDestination = Join-Path $distributionFolder "docs"
     $licensesDestination = Join-Path $distributionFolder "licenses"
     New-Item -ItemType Directory -Force -Path $baseDestination | Out-Null
+    New-Item -ItemType Directory -Force -Path $assetsDestination | Out-Null
     New-Item -ItemType Directory -Force -Path $docsDestination | Out-Null
     New-Item -ItemType Directory -Force -Path $licensesDestination | Out-Null
 
@@ -56,6 +80,8 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot "dictionaries\base\british_words.txt") -Destination $baseDestination
     Copy-Item -LiteralPath (Join-Path $projectRoot "dictionaries\base\README.md") -Destination $baseDestination
     Copy-Item -LiteralPath (Join-Path $projectRoot "dictionaries\base\SCOWL-COPYRIGHT.txt") -Destination $baseDestination
+    Copy-Item -LiteralPath $iconPngPath -Destination $assetsDestination
+    Copy-Item -LiteralPath $iconPath -Destination $assetsDestination
     Copy-Item -LiteralPath (Join-Path $projectRoot "docs\USER_GUIDE.md") -Destination $docsDestination
     Copy-Item -LiteralPath (Join-Path $projectRoot "LICENSE") -Destination $distributionFolder
     Copy-Item -LiteralPath (Join-Path $projectRoot "README.md") -Destination $distributionFolder
@@ -73,8 +99,11 @@ try {
 
     $requiredReleasePaths = @(
         $executablePath,
+        (Join-Path $distributionFolder "SubtitleUniverseUpdater.exe"),
         (Join-Path $distributionFolder "README.md"),
         (Join-Path $distributionFolder "LICENSE"),
+        (Join-Path $assetsDestination "subtitle-universe-quill.png"),
+        (Join-Path $assetsDestination "subtitle-universe-quill.ico"),
         (Join-Path $docsDestination "USER_GUIDE.md"),
         (Join-Path $baseDestination "american_words.txt"),
         (Join-Path $baseDestination "british_words.txt"),

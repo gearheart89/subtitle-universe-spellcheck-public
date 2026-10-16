@@ -69,6 +69,34 @@ class InterfaceGroupingTests(unittest.TestCase):
         self.assertIn("[<i>Hello<i> → <i>Hello</i>]", rendered)
         self.assertIn("[reports only—does not edit]", rendered)
 
+    def test_cli_options_exposes_tkinter_retry_only_after_stop_asking(self):
+        tool = SubtitleCleanupTool()
+        tool.suppress_tkinter_startup_prompt = True
+        tool.configure_tkinter_support_cli = Mock()
+        output = io.StringIO()
+
+        with (
+            patch("app.subtitle_cleanup.clear_screen"),
+            patch("app.subtitle_cleanup.tkinter_preflight_required", return_value=True),
+            patch("builtins.input", side_effect=["6", "0"]),
+            patch("sys.stdout", output),
+        ):
+            tool.options_menu()
+
+        self.assertIn("Install/check Tkinter GUI support", output.getvalue())
+        tool.configure_tkinter_support_cli.assert_called_once_with()
+
+        tool.suppress_tkinter_startup_prompt = False
+        output = io.StringIO()
+        with (
+            patch("app.subtitle_cleanup.clear_screen"),
+            patch("app.subtitle_cleanup.tkinter_preflight_required", return_value=True),
+            patch("builtins.input", return_value="0"),
+            patch("sys.stdout", output),
+        ):
+            tool.options_menu()
+        self.assertNotIn("Install/check Tkinter GUI support", output.getvalue())
+
     def test_main_menu_flush_help_explains_scope_without_flushing(self):
         tool = SubtitleCleanupTool()
         log_path = Path(__file__).with_name("_main_menu_flush_help.jsonl")

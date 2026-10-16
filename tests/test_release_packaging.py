@@ -23,7 +23,10 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("app/__init__.py", destinations)
         self.assertIn("app/subtitle_cleanup.py", destinations)
         self.assertIn("app/subtitle_gui.py", destinations)
+        self.assertIn("app/update_helper.py", destinations)
         self.assertIn("SubtitleUniverseSpellcheck.pyw", destinations)
+        self.assertIn("assets/subtitle-universe-quill.png", destinations)
+        self.assertIn("assets/subtitle-universe-quill.ico", destinations)
         self.assertNotIn("app/SubtitleUniverseSpellcheck.pyw", destinations)
         self.assertIn("dictionaries/base/american_words.txt", destinations)
         self.assertIn("dictionaries/base/british_words.txt", destinations)
@@ -110,6 +113,11 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn('"README.md"', script)
         self.assertIn("--version", script)
         self.assertIn("Forbidden runtime data", script)
+        self.assertIn("SubtitleUniverseUpdater.exe", script)
+        self.assertIn('"app\\update_helper.py"', script)
+        self.assertIn("--icon", script)
+        self.assertIn('"assets\\subtitle-universe-quill.ico"', script)
+        self.assertIn('"assets\\subtitle-universe-quill.png"', script)
 
     def test_windows_builder_pin_matches_build_requirements(self):
         script = (PROJECT_ROOT / "tools" / "build_windows.ps1").read_text(

@@ -36,6 +36,9 @@ sets; scanning must not rebuild their combined vocabulary for every token.
 app/
     subtitle_cleanup.py
     subtitle_gui.py
+assets/
+    subtitle-universe-quill.png
+    subtitle-universe-quill.ico
 SubtitleUniverseSpellcheck.pyw
 tools/
     build_multiplatform_release.py
@@ -179,6 +182,25 @@ five-second opportunity to press Enter and choose again before continuing.
 Changing the choice atomically creates the new marker and removes the old one;
 deleting the marker manually restores first-run selection. Both markers are
 ignored runtime data and are absent from release archives.
+
+Tkinter availability is preflighted only for non-frozen source launches on
+Linux and macOS when the GUI may be used. Windows source launches do not run
+the check because official Windows Python installers bundle Tcl/Tk; frozen
+builds do not run it because the release build controls its bundled runtime.
+Explicit CLI launches and a retained CLI launcher choice likewise do not
+require Tkinter. When a relevant source interpreter cannot import both
+`tkinter` and `_tkinter`, a terminal prompt accepts Yes, No, or Stop asking.
+Yes invokes only a recognized operating-system package manager and verifies
+the import afterward. No starts the CLI for that launch without saving a
+choice. Stop asking atomically records suppression in
+`dictionaries/options.ini`, bypasses the interface chooser, and starts the CLI
+on subsequent launches while Tkinter remains absent. Suppression is cleared
+automatically when support is detected or successfully installed. Only while
+suppression is active, CLI Options exposes an Install/check Tkinter GUI support
+action. Failure or an unknown package manager leaves the CLI usable and does
+not modify application files itself. Unknown-manager guidance links to the
+official Python Tkinter documentation and provides `python -m tkinter` as the
+post-installation verification command.
 
 When a terminal is available, selection and the five-second override use text
 prompts. A Windows `.pyw` process has no console, so it provides the equivalent
@@ -332,9 +354,13 @@ trailing ellipsis while the complete underlying value remains available to
 Edit, Move, and Remove operations.
 Dictionary-maintenance and Recent Additions tables alternate light and very
 light gray rows to make wide entries easier to track. The sidebar separates its heading groups with thin
-light-blue rules. On Windows the process receives a stable application identity
-before Tk starts so its taskbar button uses the window's quill icon rather than
-the Python executable icon.
+light-blue rules. The application owns one quill artwork in cross-platform PNG
+and Windows multi-resolution ICO forms. Every application-owned Tk root loads
+and retains the PNG as its window icon; missing or unreadable artwork is
+nonfatal. On Windows the process receives a stable application identity before
+Tk starts, and PyInstaller embeds the ICO into the main executable so Explorer,
+shortcuts, the title bar, and taskbar use the same project identity rather than
+Python or PyInstaller defaults.
 
 An About item appears beneath Options. Its main-window view shows the running
 version, the public GitHub project link, the MIT source-license identification,
@@ -424,6 +450,11 @@ Subtitle Layout and Dialogue, Common Error Cleanup, and Menus and Display
 submenus. Options and writable word, name, and substitution dictionaries are
 published through flushed sibling temporary files and atomic replacement so an
 interrupted rewrite cannot expose a partially written final file. They include:
+
+The same file contains internal confirmation/suppression state that is not a
+normal scan option. In particular, the optional POSIX Tkinter Stop-asking flag
+controls the conditional CLI recovery action described in Section 3.1 and is
+not shown as a regular GUI option.
 
 | Option | Default |
 | --- | ---: |
@@ -843,11 +874,18 @@ copying `dictionaries/user`, `dictionaries/universes`, and optionally
 `dictionaries/options.ini` into a newly extracted release while the program is
 closed. The base dictionary folder is replaced by each release.
 
+The Windows build must fail early when either tracked quill asset is missing,
+pass the multi-resolution ICO through PyInstaller's `--icon` option, copy both
+assets into the distribution, and include them in the required-file audit. The
+universal source archive includes the same PNG and ICO through its explicit
+allowlist.
+
 ## 14.1 Multi-platform source distribution
 
 The universal source ZIP runs on Windows, macOS, and Linux with Python 3.9 or
 later and Tkinter. It contains only the `app` runtime scripts, immutable base
-dictionaries and SCOWL notice, README, user guide, and MIT license. An explicit
+dictionaries and SCOWL notice, quill application assets, README, user guide,
+and MIT license. An explicit
 allowlist excludes development documents (`SPEC.md`, `STATUS.md`, and findings),
 tests, build tooling, subtitles, User and Universe dictionaries, options, theme
 preferences, recovery state, logs, backups, and prior artifacts. The release is
@@ -905,45 +943,64 @@ GitHub-provided digest. Cancellation or failure leaves the installed program
 and personal data untouched and removes partial downloads. Stage 1 does not
 extract, install, replace, restart, or delete application files.
 
-### Stage 2 — verified guided installation
+### Stage 2 — verified guided installation (superseded)
 
-A later release may validate and extract the downloaded archive into a staging
-directory, explain the files and personal-data locations that will be retained,
-and guide the user through a manual installation. It must preserve User and
-Universe dictionaries, options, theme settings, recovery state, logs, and the
-portable launcher preference, and must leave the existing installation intact
-when validation fails.
+The planned guided-only installer was intentionally skipped when Stage 3 was
+implemented. The verified ZIP remains available for users who prefer manual
+installation, and the automatic path performs the same validation and data-
+preservation work transactionally.
 
 ### Stage 3 — transactional self-update
 
-A later Windows updater may launch a helper outside the installation directory,
-exit the running application, replace the complete PyInstaller one-folder
-distribution rather than only its executable, restart the new version, and
-roll back to the prior installation if replacement or startup validation fails.
-Equivalent source-package updating must use the same staging, personal-data,
-and rollback principles. Permission failures and read-only installation
-locations must produce guidance rather than partial replacement.
+After a separately confirmed verified download, both interfaces may offer
+automatic installation. The engine must revalidate the local ZIP/checksum,
+reject unsafe paths and links, extract one complete distribution outside the
+installation, and refuse automatic replacement of a Git working copy. Source
+packages copy the standard-library helper script outside the installation;
+Windows packages include a separately frozen helper executable.
 
-### `v1.1.0` publishing checklist
+The external helper waits for the running application to exit, renames the old
+complete installation to a rollback location, moves the staged distribution
+into the original path, restores User and Universe dictionaries, options,
+theme settings, CLI/GUI recovery, logs, launcher preference, and subtitle or
+backup files stored beneath the portable application folder, and invokes the
+new runtime's version check. Only then may it restart the same GUI or CLI
+interface. Failed exchange or validation must restore and restart the prior
+version; permission failures must not leave a partial installation.
 
-Before publishing the GUI-capable `v1.1.0` release from `main`:
+The restarted launcher receives a narrowly validated cleanup path for the
+external helper directory. It attempts removal only when the path is an
+expected updater sibling of the installation. If Windows still locks the
+helper, startup remains successful, a small pending-cleanup record is retained
+under `dictionaries`, and a later launch retries. Staging directories and stale
+rollback copies are cleanup debris after a validated restart, not grounds to
+undo an otherwise successful update.
 
-1. Complete and test Stage 1 in both GUI and CLI interfaces.
-2. Change the internal version and all release-facing references from the
-   development identifier to `1.1.0`.
+### `v1.1.1` publishing checklist
+
+Before publishing the Stage 3 updater release from `main`:
+
+1. Exercise a genuinely newer, temporary normal GitHub release from both an
+   extracted source installation and the frozen Windows package. Verify public
+   download/checksum selection, distribution exchange, health validation,
+   same-interface restart, exact portable-data preservation, and removal of
+   staging, rollback, and helper paths; then remove the temporary release/tag.
+2. Change the internal version and release-facing references from the temporary
+   identifier to stable `1.1.1`.
 3. Run Python compilation and the complete deterministic regression suite.
-4. Build fresh universal-source and Windows x64 archives from the exact release
-   commit; do not reuse dev64 artifacts after runtime changes.
-5. Verify both SHA-256 files, archive allowlists, required notices, and absence
+4. Merge the validated development state into `main` and tag that exact commit
+   `v1.1.1`.
+5. Build fresh universal-source and Windows x64 archives from the exact tagged
+   commit; never rename or reuse temporary-test artifacts.
+6. Verify both SHA-256 files, archive allowlists, required notices, and absence
    of subtitles or writable personal/runtime data.
-6. Smoke-test the extracted source GUI/CLI, frozen GUI/CLI, formatting
+7. Smoke-test the extracted source GUI/CLI, frozen GUI/CLI, formatting
    preparation, and exact-byte backup restoration.
-7. Commit the validated state to `main`, tag that exact commit `v1.1.0`, and
-   publish only its matching archives/checksums with the unsigned-Windows and
+8. Publish only the matching archives/checksums with the unsigned-Windows and
    physically-untested macOS/Linux disclosures.
-8. Create `development` from the tagged commit. Future features merge through
-   `development`; release-ready changes return to `main`, and hotfixes made on
-   `main` are merged back into `development`.
+9. Merge or fast-forward the tagged release state back into `development`;
+   future features remain on `development`, and hotfixes made on `main` must be
+   returned there.
 
 ## 15. Deferred ideas
 

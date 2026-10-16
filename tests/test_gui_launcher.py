@@ -16,6 +16,9 @@ from app.subtitle_cleanup import (
 )
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
 class GuiLauncherTests(unittest.TestCase):
     def test_gui_backup_restore_confirmation_restores_exact_bytes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -900,6 +903,35 @@ class GuiLauncherTests(unittest.TestCase):
                 platform="linux", setter=setter
             )
         )
+
+    def test_application_icon_is_applied_and_retained_by_the_window(self):
+        window = Mock()
+        image = object()
+        image_factory = Mock(return_value=image)
+
+        applied = subtitle_gui.apply_application_window_icon(
+            window,
+            icon_path=PROJECT_ROOT / "assets" / "subtitle-universe-quill.png",
+            image_factory=image_factory,
+        )
+
+        self.assertTrue(applied)
+        image_factory.assert_called_once_with(
+            file=str(PROJECT_ROOT / "assets" / "subtitle-universe-quill.png")
+        )
+        window.iconphoto.assert_called_once_with(True, image)
+        self.assertIs(window._subtitle_universe_icon, image)
+
+    def test_application_icon_missing_is_nonfatal(self):
+        window = Mock()
+        applied = subtitle_gui.apply_application_window_icon(
+            window,
+            icon_path=PROJECT_ROOT / "assets" / "missing.png",
+            image_factory=Mock(),
+        )
+
+        self.assertFalse(applied)
+        window.iconphoto.assert_not_called()
 
     def test_dictionary_prompt_uses_one_two_field_form_for_substitutions(self):
         gui = subtitle_gui.SubtitleSpellcheckGUI.__new__(

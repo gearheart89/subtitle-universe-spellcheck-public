@@ -11,10 +11,13 @@ import argparse
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -40,8 +43,12 @@ try:
         SpellcheckReviewSession,
         SubtitleCleanupTool,
         UpdateError,
+        application_root,
         count_nonblank_lines,
+        install_tkinter_support,
         main as run_cli,
+        tkinter_is_available,
+        tkinter_preflight_required,
         wait_for_enter_to_customize,
     )
 except ImportError:  # Direct execution: python app/subtitle_gui.py
@@ -65,8 +72,12 @@ except ImportError:  # Direct execution: python app/subtitle_gui.py
         SpellcheckReviewSession,
         SubtitleCleanupTool,
         UpdateError,
+        application_root,
         count_nonblank_lines,
+        install_tkinter_support,
         main as run_cli,
+        tkinter_is_available,
+        tkinter_preflight_required,
         wait_for_enter_to_customize,
     )
 
@@ -83,6 +94,7 @@ LAUNCH_GUI_MARKER = "launch gui.txt"
 LAUNCH_CLI_MARKER = "launch cli.txt"
 LAUNCH_MODE_CHANGE_SECONDS = 5
 WINDOWS_NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+UPDATE_CLEANUP_MARKER = Path("dictionaries/pending_update_cleanup.json")
 
 
 def load_portable_launch_mode(application_root: Path) -> Optional[str]:
@@ -146,6 +158,7 @@ def prompt_gui_launch_mode(
 
     root = tk.Tk()
     root.title("Subtitle Universe Spellcheck")
+    apply_application_window_icon(root, image_factory=tk.PhotoImage)
     root.resizable(False, False)
     result: dict[str, Optional[str]] = {"mode": None}
     pending_after: dict[str, Optional[str]] = {"id": None}
@@ -262,6 +275,93 @@ def should_detach_gui_launcher(
         platform_name != "win32"
         and environment.get(DETACHED_GUI_ENVIRONMENT_VARIABLE) != "1"
     )
+
+
+def ensure_tkinter_for_gui(
+    tool,
+    *,
+    platform_name: Optional[str] = None,
+    frozen: Optional[bool] = None,
+    has_console: Optional[bool] = None,
+    force_prompt: bool = False,
+    input_func=input,
+    output_stream=None,
+    availability_checker: Callable[[], bool] = tkinter_is_available,
+    installer: Callable[..., bool] = install_tkinter_support,
+) -> bool:
+    """Offer a recoverable CLI path when optional POSIX Tkinter is absent."""
+    current_platform = platform_name if platform_name is not None else sys.platform
+    if not tkinter_preflight_required(
+        platform_name=current_platform,
+        frozen=frozen,
+    ):
+        return True
+    output_stream = output_stream if output_stream is not None else sys.stdout
+    available = availability_checker()
+    if available:
+        if getattr(tool, "suppress_tkinter_startup_prompt", False):
+            tool.set_tkinter_startup_prompt_suppressed(False)
+        return True
+
+    if getattr(tool, "suppress_tkinter_startup_prompt", False) and not force_prompt:
+        print(
+            "Tkinter GUI support is not installed and its startup question is "
+            "disabled. Starting the command-line interface.",
+            file=output_stream,
+        )
+        return False
+
+    has_console = console_is_interactive() if has_console is None else has_console
+    if not has_console:
+        print(
+            "Tkinter GUI support is not installed. Start this launcher from a "
+            "terminal to install it; the command-line interface will be used now.",
+            file=output_stream,
+        )
+        return False
+
+    print(
+        "\nTkinter GUI support is not installed for this Python interpreter.\n"
+        "It is required only for the graphical interface; the command-line "
+        "interface remains available.\n",
+        file=output_stream,
+    )
+    while True:
+        try:
+            answer = input_func(
+                "Install Tkinter now? (Y)es, (N)o, or (S)top asking: "
+            ).strip().casefold()
+        except (EOFError, OSError):
+            answer = "n"
+        if answer in {"y", "yes", "n", "no", "s", "stop"}:
+            break
+        print("Enter Y, N, or S.", file=output_stream)
+
+    if answer in {"s", "stop"}:
+        tool.set_tkinter_startup_prompt_suppressed(True)
+        print(
+            "The startup question has been disabled. Starting the command-line "
+            "interface. You can retry installation from CLI Options.",
+            file=output_stream,
+        )
+        return False
+    if answer in {"n", "no"}:
+        print("Starting the command-line interface for this launch.", file=output_stream)
+        return False
+
+    if not installer(platform_name=current_platform, output_stream=output_stream):
+        return False
+    if not availability_checker():
+        print(
+            "The package manager completed, but this Python interpreter still "
+            "cannot import Tkinter. Starting the command-line interface.",
+            file=output_stream,
+        )
+        return False
+    if getattr(tool, "suppress_tkinter_startup_prompt", False):
+        tool.set_tkinter_startup_prompt_suppressed(False)
+    print("Tkinter GUI support is ready.", file=output_stream)
+    return True
 
 RECENT_ADDITION_CATEGORIES = ("Words, names, and acronyms", "Substitutions")
 RECENT_ADDITION_CATEGORY_WIDTH = (
@@ -855,6 +955,7 @@ ACRONYM_HELP = (
 )
 
 WINDOWS_APP_ID = "gearheart89.SubtitleUniverseSpellcheck"
+APPLICATION_ICON_RELATIVE_PATH = Path("assets/subtitle-universe-quill.png")
 
 
 def configure_windows_app_identity(
@@ -871,6 +972,29 @@ def configure_windows_app_identity(
             setter = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
         setter(WINDOWS_APP_ID)
     except (AttributeError, OSError):
+        return False
+    return True
+
+
+def apply_application_window_icon(
+    window,
+    *,
+    icon_path: Optional[Path] = None,
+    image_factory=None,
+) -> bool:
+    """Apply and retain the project-owned cross-platform quill window icon."""
+    path = Path(icon_path or (application_root() / APPLICATION_ICON_RELATIVE_PATH))
+    if not path.is_file():
+        return False
+    try:
+        if image_factory is None:
+            import tkinter as tk
+
+            image_factory = tk.PhotoImage
+        image = image_factory(file=os.fspath(path))
+        window.iconphoto(True, image)
+        window._subtitle_universe_icon = image
+    except (OSError, RuntimeError, ValueError):
         return False
     return True
 
@@ -1071,6 +1195,7 @@ class SubtitleSpellcheckGUI:
         configure_windows_app_identity()
         self.root = tk.Tk()
         self.root.title(f"Subtitle Universe Spellcheck {SCRIPT_VERSION}")
+        apply_application_window_icon(self.root, image_factory=tk.PhotoImage)
         self.root.geometry(f"{WINDOW_INITIAL_WIDTH}x{WINDOW_INITIAL_HEIGHT}")
         self.root.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.root.configure(background=self.COLORS["surface"])
@@ -1111,6 +1236,7 @@ class SubtitleSpellcheckGUI:
         self.prepare_thread = None
         self.update_queue = queue.Queue()
         self.update_thread = None
+        self.update_installing = False
         self.review_session: Optional[SpellcheckReviewSession] = None
         self.current_issue: Optional[SpellcheckIssuePreview] = None
         self.pending_action: Optional[str] = None
@@ -3442,25 +3568,39 @@ class SubtitleSpellcheckGUI:
         if event == "available" and payload is not None:
             self._offer_update_download(payload)
         elif event == "downloaded":
-            archive_path, checksum_path = payload
+            update, archive_path, checksum_path = payload
             self.status_value.set(f"Update downloaded • {archive_path.name}")
-            self.messagebox.showinfo(
+            install_now = self.messagebox.askyesno(
                 "Update downloaded",
-                "The verified update ZIP was downloaded. It has not been installed and "
-                "no application files were replaced.\n\n"
-                f"ZIP: {archive_path}\nChecksum: {checksum_path}",
+                "The verified update ZIP was downloaded. No application files have "
+                "been replaced yet.\n\n"
+                f"ZIP: {archive_path}\nChecksum: {checksum_path}\n\n"
+                "Install it now? The application will close, replace the complete "
+                "distribution, validate the new version, and restart. Personal "
+                "dictionaries, settings, recovery data, logs, subtitles, and backups "
+                "will be retained.",
             )
+            if install_now:
+                self._start_update_installation(update, archive_path)
         elif event == "download_error":
             self.status_value.set("Update download failed • Existing files unchanged")
             self.messagebox.showerror("Update download failed", str(payload))
+        elif event == "install_error":
+            self.update_installing = False
+            self.status_value.set("Update installation not started • Existing files unchanged")
+            self.messagebox.showerror("Update installation could not start", str(payload))
+        elif event == "install_started":
+            self.status_value.set("Updater ready • Closing this version")
+            self.root.after(100, self.root.destroy)
 
     def _offer_update_download(self, update: ReleaseUpdate) -> None:
         if not self.messagebox.askyesno(
             "Update available",
             f"Subtitle Universe Spellcheck {update.version} is available.\n\n"
             f"{update.name}\n{update.page_url}\n\n"
-            "Would you like to download the verified ZIP now? Stage 1 only downloads "
-            "the archive; it does not install it or replace your files.",
+            "Would you like to download the verified ZIP now? After verification you "
+            "can either keep the ZIP for manual installation or install it "
+            "automatically with rollback protection.",
         ):
             return
         default_directory = Path.home() / "Downloads"
@@ -3485,7 +3625,41 @@ class SubtitleSpellcheckGUI:
             except UpdateError as error:
                 self.update_queue.put(("download_error", error))
             else:
-                self.update_queue.put(("downloaded", result))
+                archive_path, checksum_path = result
+                self.update_queue.put(
+                    ("downloaded", (update, archive_path, checksum_path))
+                )
+
+        self.update_thread = threading.Thread(target=worker, daemon=True)
+        self.update_thread.start()
+        self.root.after(100, self._poll_update_queue)
+
+    def _start_update_installation(self, update: ReleaseUpdate, archive_path: Path) -> None:
+        if self.prepare_thread is not None and self.prepare_thread.is_alive():
+            self.messagebox.showwarning(
+                "Finish the current scan step",
+                "Wait for the current scan operation to finish, then restart the "
+                "application to install the downloaded update.",
+                parent=self.root,
+            )
+            return
+        if self.review_session is not None and not self._checkpoint_review(paused=True):
+            return
+        self.update_installing = True
+        self.status_value.set(f"Preparing update • {update.version}")
+
+        def worker() -> None:
+            try:
+                prepared = self.tool.prepare_update_installation(
+                    update,
+                    archive_path,
+                    interface="gui",
+                )
+                self.tool.launch_prepared_update(prepared)
+            except (OSError, RuntimeError, UpdateError, ValueError, zipfile.BadZipFile) as error:
+                self.update_queue.put(("install_error", error))
+            else:
+                self.update_queue.put(("install_started", prepared))
 
         self.update_thread = threading.Thread(target=worker, daemon=True)
         self.update_thread.start()
@@ -5875,6 +6049,14 @@ class SubtitleSpellcheckGUI:
         self.status_value.set(f"{title} • Changes save immediately")
 
     def _close_window(self) -> None:
+        if getattr(self, "update_installing", False):
+            self.messagebox.showinfo(
+                "Update preparation in progress",
+                "Please wait while the verified update is prepared. The application "
+                "will close automatically only after the external updater is ready.",
+                parent=self.root,
+            )
+            return
         if not self._confirm_theme_navigation("close"):
             return
         session = getattr(self, "review_session", None)
@@ -5912,7 +6094,66 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the application version and exit",
     )
+    parser.add_argument(
+        "--update-cleanup",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     return parser
+
+
+def complete_update_cleanup(
+    requested_path: Optional[Path] = None,
+    *,
+    root: Optional[Path] = None,
+    remover: Callable[..., object] = shutil.rmtree,
+    sleeper: Callable[[float], None] = time.sleep,
+    attempts: int = 30,
+) -> bool:
+    """Remove an exited external updater, retaining a safe retry marker on failure."""
+    installation = (root or application_root()).resolve()
+    marker = installation / UPDATE_CLEANUP_MARKER
+    cleanup_path = Path(requested_path).resolve() if requested_path else None
+    if cleanup_path is None and marker.is_file():
+        try:
+            saved = json.loads(marker.read_text(encoding="utf-8"))
+            cleanup_path = Path(saved["path"]).resolve()
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError):
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            return False
+    if cleanup_path is None:
+        return True
+
+    valid = (
+        cleanup_path.parent == installation.parent
+        and cleanup_path.name.startswith(".subtitle-universe-update-helper-")
+        and cleanup_path != installation
+    )
+    if not valid:
+        return False
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temporary_marker = marker.with_suffix(marker.suffix + ".tmp")
+    try:
+        temporary_marker.write_text(
+            json.dumps({"schema": 1, "path": str(cleanup_path)}), encoding="utf-8"
+        )
+        os.replace(temporary_marker, marker)
+    except OSError:
+        return False
+
+    for attempt in range(max(1, attempts)):
+        try:
+            if cleanup_path.exists():
+                remover(cleanup_path)
+            marker.unlink(missing_ok=True)
+            return True
+        except OSError:
+            if attempt + 1 < max(1, attempts):
+                sleeper(0.1)
+    return False
 
 
 def detach_frozen_gui_console(
@@ -5948,14 +6189,31 @@ def launch_application(
     gui_factory: Optional[Callable[[], SubtitleSpellcheckGUI]] = None,
     cli_runner: Optional[Callable[[], None]] = None,
     console_detacher: Optional[Callable[[], object]] = None,
+    tool_factory: Callable[[], SubtitleCleanupTool] = SubtitleCleanupTool,
+    tkinter_guard: Callable[..., bool] = ensure_tkinter_for_gui,
+    platform_name: Optional[str] = None,
+    frozen: Optional[bool] = None,
+    has_console: Optional[bool] = None,
 ) -> int:
     arguments = build_argument_parser().parse_args(list(argv) if argv is not None else None)
+    complete_update_cleanup(arguments.update_cleanup)
     if arguments.version:
         print(f"Subtitle Universe Spellcheck {SCRIPT_VERSION}")
         return 0
     if arguments.cli:
         (cli_runner or run_cli)()
         return 0
+    current_platform = platform_name if platform_name is not None else sys.platform
+    if tkinter_preflight_required(platform_name=current_platform, frozen=frozen):
+        tool = tool_factory()
+        if not tkinter_guard(
+            tool,
+            platform_name=current_platform,
+            frozen=frozen,
+            has_console=has_console,
+        ):
+            (cli_runner or run_cli)()
+            return 0
     (console_detacher or detach_frozen_gui_console)()
     (gui_factory or SubtitleSpellcheckGUI)().run()
     return 0
@@ -5967,6 +6225,7 @@ def show_startup_error(message: str) -> None:
     from tkinter import messagebox
 
     root = tk.Tk()
+    apply_application_window_icon(root, image_factory=tk.PhotoImage)
     root.withdraw()
     try:
         messagebox.showerror("Subtitle Universe Spellcheck", message, parent=root)
@@ -6046,13 +6305,34 @@ def launch_cli_in_new_console(
     return 0
 
 
-def launch_portable_wrapper(script_path: Path) -> int:
+def launch_portable_wrapper(
+    script_path: Path,
+    *,
+    tool_factory: Callable[[], SubtitleCleanupTool] = SubtitleCleanupTool,
+    platform_name: Optional[str] = None,
+    frozen: Optional[bool] = None,
+) -> int:
     """Route the root `.pyw` through its recoverable portable preference."""
     environment = os.environ
     if environment.get(DETACHED_GUI_ENVIRONMENT_VARIABLE) == "1":
         return launch_gui_only()
 
     has_console = console_is_interactive()
+    current_platform = platform_name if platform_name is not None else sys.platform
+    needs_tkinter_check = tkinter_preflight_required(
+        platform_name=current_platform,
+        frozen=frozen,
+    )
+    saved_mode = load_portable_launch_mode(script_path.parent)
+    if needs_tkinter_check and saved_mode != "cli":
+        tool = tool_factory()
+        if not ensure_tkinter_for_gui(
+            tool,
+            platform_name=current_platform,
+            frozen=frozen,
+            has_console=has_console,
+        ):
+            return launch_application(["--cli"])
     try:
         mode = choose_portable_launch_mode(
             script_path.parent,
@@ -6068,6 +6348,15 @@ def launch_portable_wrapper(script_path: Path) -> int:
     if mode is None:
         return 0
     if mode == "gui":
+        if needs_tkinter_check and saved_mode == "cli":
+            tool = tool_factory()
+            if not ensure_tkinter_for_gui(
+                tool,
+                platform_name=current_platform,
+                frozen=frozen,
+                has_console=has_console,
+            ):
+                return launch_application(["--cli"])
         if should_detach_gui_launcher(environment=environment):
             return launch_detached_gui_only(script_path, environment=environment)
         return launch_gui_only()

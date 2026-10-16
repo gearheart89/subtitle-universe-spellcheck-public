@@ -36,10 +36,21 @@ preparation use the same tag-, abbreviation-, and URL-aware implementation.
 - Windows, macOS, or Linux
 - No third-party Python packages
 
-Some Linux distributions package Tkinter separately as `python3-tk` or
-`python3-tkinter`. Windows is the currently hardware-tested platform. macOS and
-Linux are expected to work and have automated cross-platform coverage, but have
+Windows is the currently hardware-tested platform. macOS and Linux are expected
+to work and have automated cross-platform coverage, but have
 not yet been validated on physical systems by the project.
+
+Official Windows Python installers bundle Tkinter, and the frozen Windows
+release carries the GUI components selected at build time, so neither route
+runs a Tkinter preflight. Some Linux distributions and Homebrew Python package
+Tkinter separately. A source launch on Linux or macOS checks before offering
+the GUI. If Tkinter is missing, the terminal prompt can install it through a
+recognized package manager, use the CLI for that launch, or stop asking and
+use the CLI on future launches. The suppressed prompt can be restored through
+CLI **Options → Install/check Tkinter GUI support**. If the package manager is
+not recognized, the message links to the
+[official Tkinter documentation](https://docs.python.org/3/library/tkinter.html)
+and suggests `python -m tkinter` to verify a manual installation.
 
 ## Run
 
@@ -60,6 +71,13 @@ until one of those choices is entered. The choice creates either
 `launch gui.txt` or `launch cli.txt` beside the launcher. On later launches it
 shows the saved mode and gives you five seconds to press Enter and choose
 again. You can also delete the marker file to restore the first-run choice.
+
+On Linux and macOS source packages, the optional Tkinter check occurs only
+when a GUI launch may be needed. An existing CLI preference and an explicit
+`--cli` launch do not require Tkinter. Choosing **No** at the missing-Tkinter
+prompt uses the CLI once and asks again when a later GUI launch is attempted;
+choosing **Stop asking** saves that decision in `dictionaries/options.ini` and
+bypasses the GUI/CLI chooser until GUI support is retried from CLI Options.
 
 Windows `.pyw` launches have no text console, so they show the equivalent small
 choice window; choosing CLI opens a real console. On macOS or Linux, run
@@ -111,9 +129,22 @@ anything and lets you choose the destination. A frozen Windows executable
 offers the matching Windows-architecture ZIP. Source launches on Windows,
 macOS, or Linux offer the universal source ZIP. The matching `.sha256` file is
 required, and the ZIP is published at the chosen location only after its hash
-and ZIP structure are verified. This first-stage updater only downloads the
-ZIP and checksum; it does not extract, install, replace, restart, or remove any
-application or personal-data files.
+and ZIP structure are verified. After downloading, you can keep the ZIP for a
+manual installation or approve an automatic transactional installation. The
+automatic path extracts and validates the complete distribution outside the
+running application, starts an external helper, closes the old version,
+preserves portable dictionaries/settings/recovery/log data plus subtitles and
+backup archives stored beneath the application folder, replaces the whole
+distribution, checks the new version, and restarts the same interface. A failed
+validation or replacement rolls back to the prior installation.
+
+After a successful update, the restarted launcher attempts to remove the
+external helper and staging directories. Windows can briefly keep the updater
+executable locked; if so, a small pending-cleanup record is retained and the
+next launch retries automatically. Automatic installation is intentionally
+disabled inside a Git working copy—use Git to update a checkout. Permission or
+read-only-folder failures leave the existing installation unchanged and can be
+handled by extracting the verified ZIP manually.
 
 Automatic spelling guesses are deliberately avoided. Unknown words are shown
 with context and require an explicit user decision. Deterministic formatting
@@ -137,7 +168,7 @@ scopes, backup behavior, spellcheck actions, and recovery guidance.
 No subtitle files, user dictionaries, Universe dictionaries, session state,
 event logs, or backup archives are distributed by this repository.
 
-When upgrading a portable Windows copy, preserve
+When manually upgrading a portable Windows copy, preserve
 `dictionaries/user`, `dictionaries/universes`,
 `dictionaries/options.ini`, and `dictionaries/gui_theme.json`. Copy them into the same locations in the newly
 extracted folder while the program is closed. You may also copy the single
@@ -196,9 +227,12 @@ documentation, and applicable runtime redistribution notices—never local User
 or Universe dictionaries, subtitle files, session state, logs, or backups. The
 single executable opens the GUI by default and retains a console when invoked
 with `--cli`; its normal frozen GUI startup releases the otherwise unnecessary
-console window. Before creating the ZIP, the script verifies the executable's
-reported version, all required public files/notices, and the absence of known
-writable runtime-data paths.
+console window. The build requires the tracked project quill assets under
+`assets`, embeds the multi-resolution `.ico` into the executable through
+PyInstaller, and copies the PNG beside the application so Tk uses the same icon
+for source and packaged windows. Before creating the ZIP, the script verifies
+the executable's reported version, all required public files/notices/assets,
+and the absence of known writable runtime-data paths.
 
 ## Licensing and dictionary attribution
 
