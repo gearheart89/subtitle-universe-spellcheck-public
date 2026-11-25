@@ -20,6 +20,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class GuiLauncherTests(unittest.TestCase):
+    def setUp(self):
+        # Real engine instances in UI tests must never use portable user data.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.test_app_root = Path(directory.name)
+        root_patch = patch('app.subtitle_cleanup.application_root', return_value=self.test_app_root)
+        root_patch.start()
+        self.addCleanup(root_patch.stop)
+
+    def test_engine_fixture_isolates_settings_and_dictionaries(self):
+        tool = SubtitleCleanupTool()
+        self.assertEqual(tool.dict_dir, self.test_app_root / 'dictionaries')
+        self.assertNotEqual(tool.dict_dir, PROJECT_ROOT / 'dictionaries')
+
     def test_gui_backup_restore_confirmation_restores_exact_bytes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2650,6 +2664,7 @@ class GuiLauncherTests(unittest.TestCase):
         recovery_path = Mock()
         recovery_path.exists.return_value = True
         gui.tool = Mock(gui_session_state_path=recovery_path)
+        gui.tool.retire_completed_gui_review.return_value = False
         gui.tool.load_gui_review_session.return_value = session
         gui.messagebox = Mock()
         gui.messagebox.askyesnocancel.return_value = True
@@ -2679,6 +2694,7 @@ class GuiLauncherTests(unittest.TestCase):
         recovery_path = Mock()
         recovery_path.exists.return_value = True
         gui.tool = Mock(gui_session_state_path=recovery_path)
+        gui.tool.retire_completed_gui_review.return_value = False
         gui.messagebox = Mock()
         gui.messagebox.askyesnocancel.return_value = False
 
@@ -2913,7 +2929,7 @@ class GuiLauncherTests(unittest.TestCase):
         gui._search_current_line()
 
         gui.tool.search_subtitle_line_in_google.assert_called_once_with(
-            block, "wyrd", line_index=1
+            block, "wyrd", line_index=1, report_to_console=False
         )
         self.assertIs(gui.review_session, session)
         self.assertIs(gui.current_issue, issue)

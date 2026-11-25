@@ -28,13 +28,15 @@ import urllib.parse
 import urllib.error
 import urllib.request
 import webbrowser
+import unicodedata
+from functools import lru_cache
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.1.1"
+SCRIPT_VERSION = "1.1.2"
 SCHEMA_VERSION = 1
 PROJECT_URL = "https://github.com/gearheart89/subtitle-universe-spellcheck-public"
 TKINTER_DOCS_URL = "https://docs.python.org/3/library/tkinter.html"
@@ -205,7 +207,113 @@ COMMON_BASE_WORDS = """
 a about above across act action actually add after again against age ago air all almost alone along already also always am among an and another answer any anyone anything are area around as ask at away back bad be because become been before began begin behind being believe best better between big bit black blue body book both bring brother brought but by call came can cannot car care carry case cause change child children city close cold come comes coming common company complete could country course cut day days dead deal did different do does dog done door down each early earth easy end enough even ever every everything example eye face fact fall family far father feel few field find fine fire first five follow food for form found four friend from front full gave get girl give given go goes going good got great group grow had half hand happen hard has have he head hear heard heart held help her here high him himself his hold home hope house how however I idea if important in inside interest into is it its itself job just keep kind knew know known large last late later law lay learn least leave left let life light like line little live long look looked lost lot love made make man many may me mean men might mind miss moment money more morning most mother move much must my name near need never new next night no not nothing now number of off often old on once one only open or order other our out over own part pass people person place point possible power present probably problem put question quick quite read real really reason right room run said same saw say says school see seem seen set several she should show side since small so some something soon sound still stop story study such sure take talk tell than that the their them then there these they thing think this those thought three through time to together told took toward try turn two under understand until up upon us use used very voice wait walk want was water way we well went were what when where whether which while white who whole why will with within without woman word work world would year years yes yet you your
 """
 
-WORD_RE = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+|['’])?")
+def _unicode_word_ranges():
+    """Build compact letter/mark classes once from the host Unicode database."""
+    ranges = {'L': [], 'M': []}
+    previous, start = None, 0
+    for code in range(sys.maxunicode + 2):
+        category = unicodedata.category(chr(code))[0] if code <= sys.maxunicode else None
+        if category != previous:
+            if previous in ranges:
+                first, last = re.escape(chr(start)), re.escape(chr(code-1))
+                ranges[previous].append(first if start == code-1 else first + '-' + last)
+            previous, start = category, code
+    return ''.join(ranges['L']), ''.join(ranges['M'])
+
+
+_UNICODE_LETTERS, _UNICODE_MARKS = _unicode_word_ranges()
+WORD_RE = re.compile('[' + _UNICODE_LETTERS + '][' + _UNICODE_LETTERS + _UNICODE_MARKS
+    + "]*(?:['’][" + _UNICODE_LETTERS + _UNICODE_MARKS + "]+)*['’]?")
+_SUBSTITUTION_WORD_EDGE = "[\\w'’\\-" + _UNICODE_MARKS + "]"
+
+
+@lru_cache(maxsize=2048)
+def substitution_pattern(source):
+    # Match composed and decomposed accents without normalizing source text or
+    # changing offsets. Whole-token boundaries also include combining marks.
+    pieces = []
+    for char in unicodedata.normalize('NFC', source):
+        decomposed = unicodedata.normalize('NFD', char)
+        pieces.append(re.escape(char) if decomposed == char else
+            '(?:' + re.escape(char) + '|' + re.escape(decomposed) + ')')
+    escaped = ''.join(pieces)
+    if re.fullmatch(_SUBSTITUTION_WORD_EDGE + '+', source):
+        escaped = '(?<!' + _SUBSTITUTION_WORD_EDGE + ')' + escaped + '(?!' + _SUBSTITUTION_WORD_EDGE + ')'
+    return re.compile(escaped, re.IGNORECASE)
+
+@lru_cache(maxsize=2048)
+def name_substitution_pattern(source, *, possessive=True):
+    """A bare name alias may carry an unchanged apostrophe-s suffix."""
+    pieces = []
+    for char in unicodedata.normalize('NFC', source):
+        if char.isspace():
+            if not pieces or pieces[-1] != r'\s+':
+                pieces.append(r'\s+')
+            continue
+        if char in "'’":
+            pieces.append("['’]")
+            continue
+        decomposed = unicodedata.normalize('NFD', char)
+        pieces.append(re.escape(char) if decomposed == char else
+            '(?:' + re.escape(char) + '|' + re.escape(decomposed) + ')')
+    return re.compile('(?<!' + _SUBSTITUTION_WORD_EDGE + ')(?P<name>' + ''.join(pieces)
+        + (r")(?P<possessive>['’][sS])?(?!" if possessive else r")(?!")
+        + _SUBSTITUTION_WORD_EDGE + ')', re.IGNORECASE)
+
+
+def is_bare_name_substitution(source, replacement, names):
+    return bool(source and names and dictionary_key(replacement) in names
+        and not dictionary_key(source).endswith("'s")
+        and not dictionary_key(replacement).endswith("'s")
+        and source[0].isalnum()
+        and (source[-1].isalnum() or unicodedata.category(source[-1]).startswith('M'))
+        and all(char.isalnum() or char.isspace() or char in "_-'’"
+                or unicodedata.category(char).startswith('M') for char in source))
+
+
+def substitution_match_output(match, replacement, preserve_suffix, explicit_keys=()):
+    suffix = (match.group('possessive') or '') if preserve_suffix else ''
+    if suffix and unicodedata.normalize('NFC', match.group()).casefold() in explicit_keys:
+        return match.group()
+    return replacement + suffix
+
+
+def paired_single_quote_positions(text: str) -> set:
+    """Identify quote punctuation without treating internal apostrophes as quotes.
+
+    Pair only across the current cue, including line wraps. Unpaired trailing
+    apostrophes remain available to the existing elision/possessive rules.
+    """
+    def letter(char):
+        return bool(char) and unicodedata.category(char)[0] in {'L', 'M'}
+
+    opening = None
+    positions = set()
+    for index, char in enumerate(text):
+        if char not in "'‘’":
+            continue
+        previous = text[index - 1] if index else ''
+        following = text[index + 1] if index + 1 < len(text) else ''
+        if not letter(previous) and letter(following):
+            if opening is None:
+                opening = (index, "'" if char == "'" else '’')
+        elif opening is not None and char == opening[1] and letter(previous) and not letter(following):
+            positions.update((opening[0], index))
+            opening = None
+    return positions
+
+
+def visible_word_spans(text: str):
+    """Yield words and exact source spans, excluding a paired closing quote."""
+    quotes = paired_single_quote_positions(text)
+    for match in WORD_RE.finditer(text):
+        start, end = match.span()
+        if end - 1 in quotes:
+            end -= 1
+        if start < end:
+            yield text[start:end], start, end, match.group()
+
+
 SRT_TIMESTAMP_RE = re.compile(r"\d{1,2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{3}")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 BRACKETED_RE = re.compile(r"\[([^\]]+)\]")
@@ -632,12 +740,17 @@ def strip_html_tags(text: str) -> str:
 
 def dictionary_key(text: str) -> str:
     """Return a case-insensitive key with typographic apostrophes unified."""
-    return text.replace("’", "'").casefold()
+    return unicodedata.normalize("NFC", text.replace("’", "'").casefold())
 
 
 def dictionary_set_contains(values: set, key: str) -> bool:
     """Support normalized loaded sets and in-memory contexts built by callers."""
     return key in values or key.replace("'", "’") in values
+
+
+def session_ignore_key(word: str) -> str:
+    """Use the same quote stripping and Unicode identity as known-word lookup."""
+    return dictionary_key(word.strip("'’"))
 
 
 @dataclass
@@ -760,7 +873,7 @@ class DictionaryContext:
         phrases = {
             dictionary_key(phrase): phrase
             for phrase in self.user_words | self.universe_words
-            if re.search(r"\s", phrase)
+            if len(WORD_RE.findall(phrase)) >= 2
         }
         phrases.update({
             dictionary_key(preferred): preferred
@@ -780,7 +893,7 @@ class DictionaryContext:
         clean = word.strip("'’")
         if not clean:
             return True
-        lower = dictionary_key(clean)
+        lower = session_ignore_key(word)
         if session_ignores and dictionary_set_contains(session_ignores, lower):
             return True
         if (
@@ -790,6 +903,15 @@ class DictionaryContext:
             or dictionary_set_contains(self.universe_words, lower)
         ):
             return True
+        # 's can mean is/has or mark possession. Recognize a directly known
+        # stem without expanding the text or recursively accepting suffixes.
+        if lower.endswith("'s"):
+            stem = lower[:-2]
+            if (stem in LOWERCASE_WORDS
+                    or dictionary_set_contains(self.base_words, stem)
+                    or dictionary_set_contains(self.user_words, stem)
+                    or dictionary_set_contains(self.universe_words, stem)):
+                return True
         if (
             self.recognize_dropped_g_apostrophe_forms
             and has_trailing_apostrophe
@@ -807,10 +929,12 @@ class DictionaryContext:
             return True
         if preferred_acronym_casing(clean, self.acronym_set) is not None:
             return True
-        # Possessive names: O'Neill's style words are tokenized as O'Neill, but handle simple s.
+        # Both apostrophe spellings have already been normalized in lower.
+        # Remove the complete possessive suffix, retaining any apostrophes
+        # inside the known name (O'Neill's -> O'Neill, not O'Neill').
         names = self.name_map
-        name_base = lower[:-1]
-        if lower.endswith("s") and (
+        name_base = lower[:-2] if lower.endswith("'s") else lower[:-1] if lower.endswith("s") else None
+        if name_base is not None and (
             name_base in names or name_base.replace("'", "’") in names
         ):
             return True
@@ -2737,10 +2861,55 @@ class SubtitleCleanupTool:
             has_timestamp=bool(payload.get("has_timestamp", True)),
         )
 
+    def gui_review_needs_recovery(self, session: SpellcheckReviewSession) -> bool:
+        """Keep unfinished scans and unsaved text, rather than completed history."""
+        if (not session.files or session.file_index != len(session.files)
+                or session.current_issue is not None):
+            return True
+        try:
+            return self.review_has_changes(session)
+        except (OSError, RuntimeError, UnicodeError, ValueError):
+            return True
+
+    def retire_completed_gui_review(self) -> bool:
+        """Retire an old completed journal only if every prepared byte is saved.
+
+        This startup preflight changes neither options nor source files. A
+        malformed, unfinished, missing, drifted or unsaved review is retained.
+        """
+        formats = dict(self.subtitle_file_formats)
+        try:
+            payload = json.loads(gzip.decompress(self.gui_session_state_path.read_bytes()).decode('utf-8'))
+            files = [Path(value) for value in payload['files']]
+            prepared = payload['prepared_blocks']
+            if (payload.get('schema_version') not in {1, 2}
+                    or payload.get('mode', 'spellcheck') not in {'spellcheck', 'formatting'}
+                    or not files or payload.get('file_index') != len(files)
+                    or payload.get('current_issue') is not None
+                    or set(prepared) != {str(index) for index in range(len(files))}):
+                return False
+            root = Path(payload['target']).resolve()
+            for index, path in enumerate(files):
+                path.resolve().relative_to(root)
+                current = path.read_bytes()
+                self.parse_srt(path, current)
+                blocks = [self._review_block_from_payload(value) for value in prepared[str(index)]]
+                if self.encode_srt(path, blocks) != current:
+                    return False
+            self.clear_gui_review_session()
+            return True
+        except (OSError, RuntimeError, UnicodeError, ValueError, KeyError, TypeError, AttributeError, EOFError):
+            return False
+        finally:
+            self.subtitle_file_formats = formats
+
     def save_gui_review_session(
         self, session: SpellcheckReviewSession, *, paused: bool = False
     ) -> None:
         """Atomically checkpoint a GUI review for crash or power-loss recovery."""
+        if not self.gui_review_needs_recovery(session):
+            self.clear_gui_review_session()
+            return
         prepared = {}
         source_hashes = {}
         for file_index, blocks in session.prepared_blocks.items():
@@ -2838,7 +3007,7 @@ class SubtitleCleanupTool:
         session.ignored_occurrences = {
             tuple(value) for value in payload.get("ignored_occurrences", ())
         }
-        session.ignored_words = set(payload.get("ignored_words", ()))
+        session.ignored_words = {session_ignore_key(word) for word in payload.get("ignored_words", ())}
         session.substitutions = {
             str(key).casefold(): str(value)
             for key, value in payload.get("substitutions", {}).items()
@@ -2993,7 +3162,8 @@ class SubtitleCleanupTool:
             if defer_tracked_substitutions
             else self.apply_active_substitutions
         )
-        lines = [substitution_method(line, ctx) for line in lines]
+        # Quote boundaries may span a display-line wrap within the same cue.
+        lines = substitution_method('\n'.join(lines), ctx).split('\n') if lines else []
         capitalization_mode = self.options.get("capitalization_mode")
         if capitalization_mode not in CAPITALIZATION_SCAN_MODES:
             capitalization_mode = "subtitle"
@@ -3196,27 +3366,43 @@ class SubtitleCleanupTool:
         line = re.sub(r"-{2,}", "…", line)
         return line
 
-    def apply_substitutions(self, line: str, substitutions: Dict[str, str]) -> str:
+    def apply_substitutions(self, line: str, substitutions: Dict[str, str], *, names: Optional[Mapping[str, str]] = None, possessive_only: bool = False) -> str:
         result = line
+        explicit_keys = {unicodedata.normalize("NFC", key).casefold() for key in substitutions}
         # Longest first prevents a shorter substitution from damaging a longer one.
         for source_key, replacement in sorted(substitutions.items(), key=lambda kv: len(kv[0]), reverse=True):
             source = source_key
             if not source:
                 continue
-            escaped = re.escape(source)
-            if re.fullmatch(r"[A-Za-z0-9_'’\-]+", source):
-                pattern = re.compile(rf"(?<![A-Za-z0-9_'’\-]){escaped}(?![A-Za-z0-9_'’\-])", re.IGNORECASE)
-            else:
-                pattern = re.compile(escaped, re.IGNORECASE)
-            result = pattern.sub(replacement, result)
+            preserve_suffix = is_bare_name_substitution(source, replacement, names)
+            pattern = name_substitution_pattern(source) if preserve_suffix else substitution_pattern(source)
+            # Treat paired quote punctuation as a boundary, preserving its exact
+            # bytes in the result. Internal name apostrophes remain boundaries
+            # against a partial-word substitution. Never change tag attributes.
+            tag_spans = [match.span() for match in HTML_TAG_RE.finditer(result)]
+            boundary_text = HTML_TAG_RE.sub(lambda match: ' ' * len(match.group()), result)
+            quotes = paired_single_quote_positions(boundary_text)
+            if not paired_single_quote_positions(source):
+                boundary_text = ''.join(' ' if index in quotes else char
+                                        for index, char in enumerate(boundary_text))
+            pieces, offset = [], 0
+            for match in pattern.finditer(boundary_text):
+                if any(match.start() < end and match.end() > start for start, end in tag_spans):
+                    continue
+                output = (substitution_match_output(match, replacement, preserve_suffix, explicit_keys)
+                          if not possessive_only or (preserve_suffix and match.group('possessive'))
+                          else result[match.start():match.end()])
+                pieces.extend((result[offset:match.start()], output))
+                offset = match.end()
+            result = ''.join(pieces) + result[offset:]
         return result
 
-    def apply_session_substitutions(self, line: str) -> str:
-        return self.apply_substitutions(line, self.current_session_substitutions)
+    def apply_session_substitutions(self, line: str, ctx: Optional[DictionaryContext] = None) -> str:
+        return self.apply_substitutions(line, self.current_session_substitutions, names=ctx.name_map if ctx is not None else None)
 
     def apply_active_substitutions(self, line: str, ctx: DictionaryContext) -> str:
         """Apply session substitutions before persistent dictionary substitutions."""
-        return self.apply_substitutions(self.apply_session_substitutions(line), ctx.substitutions)
+        return self.apply_substitutions(self.apply_session_substitutions(line, ctx), ctx.substitutions, names=ctx.name_map)
 
     def substitution_undo_action(
         self,
@@ -3251,8 +3437,8 @@ class SubtitleCleanupTool:
             if self.substitution_undo_action(source, replacement, "persistent_substitution") is None
         }
         return self.apply_substitutions(
-            self.apply_substitutions(line, session_rules),
-            persistent_rules,
+            self.apply_substitutions(line, session_rules, names=ctx.name_map),
+            persistent_rules, names=ctx.name_map,
         )
 
     def apply_active_substitutions_to_block(
@@ -3284,10 +3470,7 @@ class SubtitleCleanupTool:
                 ):
                     continue
                 before = list(block.text_lines)
-                after = [
-                    self.apply_substitutions(line, {source: replacement})
-                    for line in before
-                ]
+                after = self.apply_substitutions('\n'.join(before), {source: replacement}, names=ctx.name_map).split('\n')
                 if after == before:
                     continue
                 block.text_lines = after
@@ -3341,17 +3524,20 @@ class SubtitleCleanupTool:
         token: str,
         ctx: DictionaryContext,
     ) -> Optional[str]:
+        trailing = token[-1:] if token.endswith(("'", "’")) else ""
+        if trailing:
+            token = token[:-1]
         lower = dictionary_key(token)
         if lower in ctx.name_map:
-            return ctx.name_map[lower]
+            return ctx.name_map[lower] + trailing
 
         possessive = re.fullmatch(r"(.+)(['’])[sS]", token)
         if possessive and dictionary_key(possessive.group(1)) in ctx.name_map:
-            return ctx.name_map[dictionary_key(possessive.group(1))] + possessive.group(2) + "s"
+            return ctx.name_map[dictionary_key(possessive.group(1))] + possessive.group(2) + "s" + trailing
 
         for suffix in ("ing", "ed", "es", "s"):
             if lower.endswith(suffix) and lower[: -len(suffix)] in ctx.name_map:
-                return ctx.name_map[lower[: -len(suffix)]] + suffix
+                return ctx.name_map[lower[: -len(suffix)]] + suffix + trailing
         return None
 
     def restore_explicit_acronym_casing(
@@ -3387,17 +3573,12 @@ class SubtitleCleanupTool:
         ctx: DictionaryContext,
     ) -> List[str]:
         result = "\n".join(lines)
-        multiword_names = [value for value in ctx.name_map.values() if re.search(r"\s", value)]
+        multiword_names = [value for value in ctx.name_map.values() if len(WORD_RE.findall(value)) >= 2]
         for preferred in sorted(multiword_names, key=len, reverse=True):
             preferred_tokens = [match.group(0) for match in WORD_RE.finditer(preferred)]
             if len(preferred_tokens) < 2:
                 continue
-            pattern = re.compile(
-                r"(?<![A-Za-z0-9_'’\-])"
-                + r"\s+".join(re.escape(token) for token in preferred_tokens)
-                + r"(?![A-Za-z0-9_'’\-])",
-                re.IGNORECASE,
-            )
+            pattern = name_substitution_pattern(preferred)
 
             def restore_match(match: re.Match) -> str:
                 token_index = 0
@@ -3408,10 +3589,24 @@ class SubtitleCleanupTool:
                     token_index += 1
                     return replacement
 
-                return WORD_RE.sub(restore_token, match.group(0))
+                suffix = match.group('possessive') or ''
+                return WORD_RE.sub(restore_token, match.group('name')) + (suffix[0]+'s' if suffix else '')
 
-            result = pattern.sub(restore_match, result)
-        return result.split("\n")
+            # Quotes participate in punctuation boundaries, never in the name.
+            # Match a same-length view and splice only name spans into the source.
+            quotes = paired_single_quote_positions(result)
+            boundary_view = ''.join(' ' if i in quotes else char for i, char in enumerate(result))
+            for match in reversed(list(pattern.finditer(boundary_view))):
+                result = result[:match.start()] + restore_match(match) + result[match.end():]
+        # Casing changes no separators; retain each input element's boundaries.
+        segments = result.split("\n")
+        restored = []
+        offset = 0
+        for line in lines:
+            width = line.count("\n") + 1
+            restored.append("\n".join(segments[offset:offset + width]))
+            offset += width
+        return restored
 
     def title_case_bracketed_sound_effects(
         self,
@@ -3612,12 +3807,12 @@ class SubtitleCleanupTool:
             return line, True
         if not force and not self.is_mostly_uppercase_line(line):
             return line, self.line_ends_sentence(line)
-        if force and not re.search(r"[A-Za-z]", BRACKETED_RE.sub("", strip_html_tags(line))):
+        if force and not WORD_RE.search(BRACKETED_RE.sub("", strip_html_tags(line))):
             return line, self.line_ends_sentence(line)
 
         tokens = re.findall(
             r"<[^>]+>|\[[^\]]+\]|[A-Za-z]{1,3}\.(?:[A-Za-z]\.)*[A-Za-z]\.?(?![A-Za-z])|"
-            r"[A-Za-z]+(?:['’][A-Za-z]+)?|\s+|.",
+            + WORD_RE.pattern + r"|\s+|.",
             line,
         )
         result: List[str] = []
@@ -3628,7 +3823,7 @@ class SubtitleCleanupTool:
                 or BRACKETED_RE.fullmatch(token)
                 or DOTTED_FORM_RE.fullmatch(token)
                 or token.isspace()
-                or not re.search(r"[A-Za-z]", token)
+                or not WORD_RE.search(token)
             ):
                 result.append(token)
                 if token in ".?!":
@@ -4076,7 +4271,7 @@ class SubtitleCleanupTool:
         preserve_choices = resume_mode in {"resume", "fresh_keep"}
         saved_ignores = state.get("session_ignore_words", [])
         self.current_session_ignores = (
-            {value.casefold() for value in saved_ignores if isinstance(value, str)}
+            {session_ignore_key(value) for value in saved_ignores if isinstance(value, str)}
             if preserve_choices and isinstance(saved_ignores, list)
             else set()
         )
@@ -4327,31 +4522,37 @@ class SubtitleCleanupTool:
         progress.clear()
         return changed, False, len(blocks)
 
-    def phrase_covered_token_indexes(
-        self,
-        visible_text: str,
-        tokens: Sequence[dict],
-        ctx: DictionaryContext,
-    ) -> set:
+    def phrase_covered_token_indexes(self, visible_text, tokens, ctx) -> set:
         covered = set()
-        phrase_tokens = []
-        for phrase in ctx.phrase_map.values():
-            values = [dictionary_key(match.group(0)) for match in WORD_RE.finditer(phrase)]
-            if len(values) >= 2:
-                phrase_tokens.append(values)
-        phrase_tokens.sort(key=len, reverse=True)
-
-        token_values = [dictionary_key(token["word"]) for token in tokens]
-        for values in phrase_tokens:
+        names = ctx.name_map
+        phrases = dict(ctx.phrase_map)
+        phrases.update({dictionary_key(value): value for value in names.values()})
+        entries = []
+        for phrase in phrases.values():
+            matches = list(WORD_RE.finditer(phrase))
+            if len(matches) < 2:
+                continue
+            values = [dictionary_key(match.group()) for match in matches]
+            gaps = [phrase[left.end():right.start()] for left, right in zip(matches, matches[1:])]
+            entries.append((values, gaps, dictionary_key(phrase) in names))
+        token_values = [dictionary_key(token['word']) for token in tokens]
+        for values, gaps, is_name in sorted(entries, key=lambda item: len(item[0]), reverse=True):
             width = len(values)
-            for start in range(0, len(tokens) - width + 1):
-                if token_values[start : start + width] != values:
+            for start in range(len(tokens)-width+1):
+                actual = token_values[start:start+width]
+                if actual != values and not (is_name and actual[:-1] == values[:-1]
+                        and actual[-1].endswith("'s") and actual[-1][:-2] == values[-1]):
                     continue
-                if all(
-                    visible_text[tokens[index]["global_end"] : tokens[index + 1]["global_start"]].isspace()
-                    for index in range(start, start + width - 1)
-                ):
-                    covered.update(range(start, start + width))
+                matched = True
+                for index, expected in enumerate(gaps):
+                    gap = visible_text[tokens[start+index]['global_end']:tokens[start+index+1]['global_start']]
+                    same_gap = gap.isspace() if expected.isspace() else (
+                        re.sub(r'\s+', ' ', gap) == re.sub(r'\s+', ' ', expected))
+                    if not same_gap:
+                        matched = False
+                        break
+                if matched:
+                    covered.update(range(start, start+width))
         return covered
 
     def find_first_unknown_word(
@@ -4368,16 +4569,19 @@ class SubtitleCleanupTool:
         visible_lines = [strip_html_tags(line) for line in block.text_lines]
         visible_text = "\n".join(visible_lines)
         tokens = []
+        closing_quotes = paired_single_quote_positions(visible_text)
         offset = 0
         for line_idx, text in enumerate(visible_lines):
             for match in WORD_RE.finditer(text):
+                end = match.end() - (offset + match.end() - 1 in closing_quotes)
                 tokens.append({
-                    "word": match.group(0),
+                    "word": text[match.start():end],
+                    "lookup_word": match.group(0),
                     "line_index": line_idx,
                     "start": match.start(),
-                    "end": match.end(),
+                    "end": end,
                     "global_start": offset + match.start(),
-                    "global_end": offset + match.end(),
+                    "global_end": offset + end,
                 })
             offset += len(text) + 1
 
@@ -4405,7 +4609,7 @@ class SubtitleCleanupTool:
                 continue
             if token_index in phrase_covered:
                 continue
-            if ctx.is_known_word(word, active_session_ignores):
+            if ctx.is_known_word(token['lookup_word'], active_session_ignores):
                 continue
             return {
                 "word": word,
@@ -4660,7 +4864,7 @@ class SubtitleCleanupTool:
         issue = session.current_issue
         if issue is None:
             return None
-        session.ignored_words.add(issue.word.casefold())
+        session.ignored_words.add(session_ignore_key(issue.word))
         session.undo_actions.append(SpellcheckReviewUndoAction("session", issue))
         session.current_issue = None
         return self._advance_spellcheck_review(
@@ -4873,8 +5077,8 @@ class SubtitleCleanupTool:
         if not preferred:
             raise ValueError("Dictionary entry text cannot be empty.")
         entry_tokens = [match.group(0) for match in WORD_RE.finditer(preferred)]
-        if not entry_tokens or issue.word.casefold() not in {
-            token.casefold() for token in entry_tokens
+        if not entry_tokens or dictionary_key(issue.word) not in {
+            dictionary_key(token) for token in entry_tokens
         }:
             raise ValueError(
                 f'The entry must include the selected word "{issue.word}".'
@@ -5041,7 +5245,7 @@ class SubtitleCleanupTool:
                 issue.word.casefold(),
             ))
         elif action.kind == "session":
-            session.ignored_words.discard(issue.word.casefold())
+            session.ignored_words.discard(session_ignore_key(issue.word))
         elif action.kind in {"replacement", "cue_edit"}:
             blocks = session.prepared_blocks.get(issue.file_number - 1)
             if blocks is None or not 0 <= issue.subtitle_index < len(blocks):
@@ -5166,10 +5370,7 @@ class SubtitleCleanupTool:
             ):
                 continue
             before = list(block.text_lines)
-            after = [
-                self.apply_substitutions(line, {source: replacement})
-                for line in before
-            ]
+            after = self.apply_substitutions('\n'.join(before), {source: replacement}, names=session.context.name_map).split('\n')
             if after == before:
                 continue
             block.text_lines = after
@@ -5401,7 +5602,7 @@ class SubtitleCleanupTool:
                     self.undo_stack.append({"type": "block_ignore", "file": rel, "subtitle_index": block_index, "word": word})
                     self.log_event({"type": "block_ignore", "file": rel, "subtitle_index": block_index, "word": word})
                 elif scope == 2:
-                    self.current_session_ignores.add(word.casefold())
+                    self.current_session_ignores.add(session_ignore_key(word))
                     self.undo_stack.append({"type": "session_ignore", "word": word})
                     self.log_event({"type": "session_ignore", "word": word})
                 return "continue"
@@ -5445,7 +5646,17 @@ class SubtitleCleanupTool:
         selected_word: str,
         *,
         line_index: Optional[int] = None,
+        report_to_console: bool = True,
     ) -> bool:
+        def report(message: str) -> None:
+            if report_to_console:
+                try:
+                    print(message)
+                except (OSError, ValueError):
+                    # A GUI may have released its Windows console. Reporting
+                    # must not change the result of the browser request.
+                    pass
+
         visible_lines = [strip_html_tags(line).strip() for line in block.text_lines]
         if line_index is not None and 0 <= line_index < len(visible_lines):
             search_text = visible_lines[line_index]
@@ -5463,19 +5674,19 @@ class SubtitleCleanupTool:
             )
         search_text = " ".join(search_text.split())
         if not search_text:
-            print("This subtitle line has no searchable text.")
+            report("This subtitle line has no searchable text.")
             return False
 
         url = "https://www.google.com/search?" + urllib.parse.urlencode({"q": search_text})
         try:
             opened = webbrowser.open(url, new=2)
         except Exception as exc:
-            print(f"The program could not open a web browser: {exc}")
+            report(f"The program could not open a web browser: {exc}")
             return False
         if not opened:
-            print("The program could not open a web browser.")
+            report("The program could not open a web browser.")
             return False
-        print("Opened a Google search for this subtitle line in your default browser.")
+        report("Opened a Google search for this subtitle line in your default browser.")
         return True
 
     def prompt_edit_source(self, block: SubtitleBlock, word: str) -> Optional[str]:
@@ -5567,12 +5778,10 @@ class SubtitleCleanupTool:
         if len(phrase_tokens) < 2:
             return False
         visible_text = "\n".join(strip_html_tags(line) for line in block.text_lines)
-        pattern = re.compile(
-            r"(?<![A-Za-z0-9_'’\-])"
-            + r"\s+".join(re.escape(token) for token in phrase_tokens)
-            + r"(?![A-Za-z0-9_'’\-])",
-            re.IGNORECASE,
-        )
+        # Keep punctuation in an exact compound: good-natured is not good natured.
+        # Share Unicode/apostrophe identity and whole-entry boundaries with names,
+        # but never infer a possessive when validating the user's exact entry.
+        pattern = name_substitution_pattern(phrase, possessive=False)
         return bool(pattern.search(visible_text))
 
     def prompt_dictionary_entry(
@@ -5662,8 +5871,8 @@ class SubtitleCleanupTool:
                 return "acronyms", preferred
             if choice in {"3", "4"} and block is not None:
                 phrase = input("Exact phrase from this subtitle: ").strip()
-                phrase_words = [match.group(0).casefold() for match in WORD_RE.finditer(phrase)]
-                if word.casefold() not in phrase_words:
+                phrase_words = [dictionary_key(match.group(0)) for match in WORD_RE.finditer(phrase)]
+                if dictionary_key(word) not in phrase_words:
                     print(f'The phrase must include the selected word "{word}".')
                     continue
                 if not self.phrase_present_in_block(phrase, block):
@@ -5984,7 +6193,7 @@ class SubtitleCleanupTool:
             })
             return True
         if typ == "session_ignore":
-            self.current_session_ignores.discard(action.get("word", "").casefold())
+            self.current_session_ignores.discard(session_ignore_key(action.get("word", "")))
         elif typ == "session_substitution":
             self.current_session_substitutions.pop(action.get("from", "").casefold(), None)
         elif typ == "block_ignore":
@@ -7912,11 +8121,14 @@ def wait_for_enter_to_customize(timeout_seconds: int) -> bool:
 def replace_first_word(line: str, source_word: str, replacement: str) -> str:
     # Match the token boundaries used by WORD_RE. Hyphens separate tokens, so
     # a selected component of a malformed form such as re-assed can be edited.
-    pattern = re.compile(
-        rf"(?<![A-Za-z'’]){re.escape(source_word)}(?![A-Za-z'’])",
-        re.IGNORECASE,
-    )
-    return pattern.sub(replacement, line, count=1)
+    token_edge = '[' + _UNICODE_LETTERS + _UNICODE_MARKS + "'’]"
+    # Reuse canonical accent variants while keeping hyphens as token breaks.
+    pattern_text = substitution_pattern(source_word).pattern
+    if re.fullmatch(_SUBSTITUTION_WORD_EDGE + '+', source_word):
+        prefix, suffix = '(?<!' + _SUBSTITUTION_WORD_EDGE + ')', '(?!' + _SUBSTITUTION_WORD_EDGE + ')'
+        pattern_text = pattern_text[len(prefix):-len(suffix)]
+    pattern = re.compile('(?<!' + token_edge + ')' + pattern_text + '(?!' + token_edge + ')', re.IGNORECASE)
+    return pattern.sub(lambda _match: replacement, line, count=1)
 
 
 def replace_visible_span(text: str, start: int, end: int, replacement: str) -> str:
@@ -7942,11 +8154,23 @@ def replace_visible_span(text: str, start: int, end: int, replacement: str) -> s
 def replace_first_word_in_lines(lines: Sequence[str], source_word: str, replacement: str) -> List[str]:
     """Replace exactly one occurrence across a subtitle block."""
     result = list(lines)
-    for index, line in enumerate(result):
-        replaced = replace_first_word(line, source_word, replacement)
-        if replaced != line:
-            result[index] = replaced
-            break
+    if WORD_RE.fullmatch(source_word) is None:
+        # The CLI also explicitly permits whole compounds and custom phrases.
+        for index, line in enumerate(result):
+            replaced = replace_first_word(line, source_word, replacement)
+            if replaced != line:
+                result[index] = replaced
+                break
+        return result
+    visible_lines = [strip_html_tags(line) for line in lines]
+    visible_text = '\n'.join(visible_lines)
+    for word, start, end, _raw in visible_word_spans(visible_text):
+        if dictionary_key(word) != dictionary_key(source_word):
+            continue
+        line_index = visible_text.count('\n', 0, start)
+        line_start = visible_text.rfind('\n', 0, start) + 1
+        result[line_index] = replace_visible_span(result[line_index], start-line_start, end-line_start, replacement)
+        break
     return result
 
 

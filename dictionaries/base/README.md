@@ -22,11 +22,15 @@ python -X utf8 -m libscowl --db scowl.db word-list 60 A 1 --deaccent
 python -X utf8 -m libscowl --db scowl.db word-list 60 B,Z 5 --deaccent
 ```
 
-The extracted entries were converted to lowercase, limited to the token forms
-the application recognizes (`A-Z`, with at most one internal apostrophe),
-deduplicated, and sorted. The packaged American list contains 107,876 entries;
-the packaged British list contains 111,181 entries. `--deaccent` supplies the
-ASCII forms expected by the application's current tokenizer.
+The extracted entries were converted to lowercase, limited by the historical
+generation filter (`A-Z`, with at most one internal apostrophe), deduplicated,
+and sorted. The packaged American list contains 107,876 entries; the packaged
+British list contains 111,181 entries. `--deaccent` supplies their ASCII forms.
+This historical generation filter describes these bundled lists, not the current
+runtime tokenizer: USC recognizes Unicode letters and combining marks, keeps
+accented source spans intact, and accepts internal apostrophes in user/universe
+entries. Accented words need an appropriate vocabulary entry; ASCII base forms
+do not silently approve a differently accented spelling.
 
 These are immutable base vocabularies. User additions belong under
 `dictionaries/user/`, and universe-specific terminology belongs under

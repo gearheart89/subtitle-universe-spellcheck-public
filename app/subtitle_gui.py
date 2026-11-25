@@ -3066,11 +3066,22 @@ class SubtitleSpellcheckGUI:
                 "The selected subtitle is no longer available in this review.",
             )
             return
-        opened = self.tool.search_subtitle_line_in_google(
-            blocks[issue.subtitle_index],
-            issue.word,
-            line_index=issue.line_index,
-        )
+        try:
+            opened = self.tool.search_subtitle_line_in_google(
+                blocks[issue.subtitle_index],
+                issue.word,
+                line_index=issue.line_index,
+                report_to_console=False,
+            )
+        except Exception as error:
+            self.messagebox.showwarning(
+                "Could not open browser",
+                "The browser request failed, but the spelling review is still "
+                f"open and unchanged.\n\n{error}",
+                parent=getattr(self, "root", None),
+            )
+            self.status_value.set("Browser request failed • Review unchanged")
+            return
         if opened:
             self.status_value.set(
                 "Opened Google search for the selected subtitle line • Review unchanged"
@@ -3668,6 +3679,8 @@ class SubtitleSpellcheckGUI:
     def _offer_gui_recovery(self) -> None:
         path = self.tool.gui_session_state_path
         if not path.exists():
+            return
+        if self.tool.retire_completed_gui_review():
             return
         choice = self.messagebox.askyesnocancel(
             "Recover interrupted GUI review?",
@@ -5016,6 +5029,16 @@ class SubtitleSpellcheckGUI:
                 ),
                 None,
             )
+            if result and result[1]:
+                entries = [str(event.get('input', event.get('word', ''))) for event in events]
+                if not self.messagebox.askyesno(
+                    'Confirm Universe move',
+                    'Move these entries to the “' + result[1] + '” Universe Dictionary?\n\n'
+                    + '\n'.join('• ' + entry for entry in entries),
+                    parent=window,
+                ):
+                    result = None
+                    return 'break'
             window.destroy()
             return "break"
 

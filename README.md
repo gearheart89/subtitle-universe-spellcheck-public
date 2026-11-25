@@ -7,6 +7,10 @@ constructed-language terms, and recurring transcription errors that do not
 belong in a general English dictionary. Both interfaces use the same tested
 engine and safety boundaries.
 
+Version **1.1.2** is a subtitle bugfix release covering accented words,
+possessives, hyphenated entries, quoted-word review, browser-search reporting,
+and completed-scan recovery.
+
 Version 1 capabilities include:
 
 - Deterministic formatting and common-error cleanup with validation reports.
@@ -21,6 +25,17 @@ Version 1 capabilities include:
   detection, format-preserving atomic subtitle writes, and rollback safeguards.
 - Ocean, Dark, and editable Custom GUI themes; the command-line interface
   retains the same core scan, formatting, dictionary, and recovery behavior.
+
+Shared spelling handles accented words, internal apostrophes and possessives
+such as `harem's` and `O'riley's`. Exact compounds such as `good-natured` can be
+added without accepting their parts separately. Paired single quotes are kept
+outside the highlighted word, including when a quote spans subtitle lines;
+informal `shootin'` still follows the dropped-g option. Name-alias substitutions
+retain possessive suffixes. Completed, saved GUI reviews no longer leave a
+recovery prompt; unsaved changes remain recoverable.
+
+This `main` branch remains subtitle-only. Ren'Py features and the standalone
+patch reviewer are maintained separately on `Ren'PY-Support`.
 
 The application runtime uses only Python's standard library. The tested engine
 and command-line interface remain in one file, with a thin Tkinter GUI that

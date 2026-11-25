@@ -142,6 +142,22 @@ Multiword entries are exact phrases: storing `Vala Mal Doran`, for example,
 does not accept `Mal` everywhere by itself. Substitution inputs match without
 regard to case and emit the stored replacement.
 
+Accented words are recognized as complete words. Add the accented spelling to
+the appropriate dictionary; an unaccented word does not automatically approve
+it. Straight and curly apostrophes have the same dictionary identity. Once
+`harem` or a name such as `O'riley` is known, its apostrophe-s form is also known.
+An explicit name alias such as `Roxelane` → `Roxelana` keeps the suffix in
+`Roxelane’s` → `Roxelana’s`. Regular word replacements remain literal.
+You can add `good-natured` as a complete accepted compound; that does not accept
+`natured` everywhere or treat `good natured` as the same entry.
+
+Single quotes around dialogue are punctuation. In `He said 'damn it all to
+heck'`, the flagged word is `heck`, and correcting it keeps the closing quote.
+The opening quote can occur on an earlier line of the same subtitle cue.
+Internal apostrophes in `O'riley's` remain part of the word. An unpaired trailing
+apostrophe keeps its existing meaning; recognizing `shootin'` as `shooting`
+still requires the informal dropped-g setting. Pairing does not cross cues.
+
 ## Interactive spellcheck
 
 For each unknown word, the program shows the current cue, two previous cues,
@@ -178,6 +194,14 @@ review, preserves source encoding and newlines, and uses atomic writes. If a
 later file cannot be written, earlier files from that save are restored. A
 successful save starts a new Undo baseline; Stop, Restart, and closing the
 window warn before discarding unsaved text.
+
+A completed review with no unsaved text retires its recovery checkpoint. A
+completed scan with unsaved edits stays recoverable until saved. Older completed
+checkpoints are checked before the recovery question and retired only if their
+prepared text is already saved in every affected file. Undo can reopen a
+completed review and create a new checkpoint. Searching from the GUI reports
+actual browser failures without treating a detached-console reporting error as
+a failed search.
 
 The GUI's **Add word / name / acronym / phrase** action starts with the highlighted
 unknown. Leave it unchanged for a single entry or expand it to an exact phrase

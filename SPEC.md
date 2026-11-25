@@ -27,6 +27,33 @@ Dictionary precedence and casing authority are:
 Internal apostrophes, including straight and curly forms, are part of a word token.
 Straight `'` and typographic `’` apostrophes have the same dictionary identity,
 so `don't` and `Don’t` match without rewriting the subtitle's punctuation.
+The shared tokenizer recognizes Unicode letters and combining marks, including
+decomposed accents, and retains complete internal-apostrophe tokens such as
+`O'riley's`. Dictionary identity uses NFC and treats straight/curly apostrophes
+equally; accents remain significant. Known Base/User/Universe words accept
+apostrophe-s clitics/possessives (`harem's`, `fun’s`), and known User/Universe names
+accept the same suffix (`Suli's`, `O'riley’s`). Unknown stems and recursively
+stacked suffixes must remain unknown. Authoritative casing preserves the suffix.
+
+An opening single quote at a word boundary can pair with a trailing single quote
+later in the same cue, including across display lines. Both straight quotes and
+curly opening/closing quotes are supported. A paired closing quote is excluded
+from the issue word, highlight and replacement span, while the source quote and
+markup are retained. Internal name/contraction apostrophes are not quote pairs.
+An unpaired trailing apostrophe retains existing possessive/elision semantics.
+`shootin'`/`shootin’`, including when quoted, is accepted only when informal
+dropped-g recognition is enabled and `shooting` is in the active vocabulary.
+Quote pairing is local to a cue; it does not infer punctuation in another cue.
+Session-ignore storage, recovery and Undo share the lookup's normalized quote
+identity so quoted words cannot repeatedly stop the same scan.
+
+Explicit aliases whose replacement is an authoritative name preserve an
+apostrophe-s suffix, including internal apostrophes and curly source forms.
+For example, `Roxelane` → `Roxelana` also corrects `Roxelane’s` → `Roxelana’s`.
+An explicit whole-possessive rule takes precedence over suffix inference.
+Other word substitutions remain literal. Matching respects Unicode word
+boundaries, protects subtitle tag attributes, and must not replace substrings
+inside another name or compound. Scoped changes retain their normal Undo owner.
 Known-token checks use direct membership in the active base, user, and universe
 sets; scanning must not rebuild their combined vocabulary for every token.
 
@@ -77,9 +104,10 @@ The packaged American and British base vocabularies are generated from the
 pinned SCOWL 2026.02.25 release at its recommended spellchecking size 60. The
 American list uses spelling category `A` and default variants. The inclusive
 British list uses categories `B,Z` through variant level 5 so both standard
-`-ise` and Oxford `-ize` forms are accepted. Generated entries are deaccented
-to match the Version 1 ASCII tokenizer, lowercased, restricted to supported
-single-word token forms, deduplicated, and sorted. The source, generation
+`-ise` and Oxford `-ize` forms are accepted. Generated entries were deaccented
+and restricted by the historical ASCII generation filter, lowercased,
+deduplicated, and sorted. That filter does not limit the current Unicode runtime
+tokenizer or make an unlisted accented spelling known. The source, generation
 parameters, and required redistribution notice are stored beside the lists.
 
 Word, name, and acronym files contain one entry per line. Acronyms are stored as one undotted alphanumeric token in authoritative casing. Their simple plural and possessive forms are recognized, and a recognized dotted spelling is normalized to the stored casing. Substitution files contain `input<TAB>output`. Substitution input matching is case-insensitive; output is emitted exactly as stored. Lists are sorted after maintenance operations, with substitutions sorted by input.
@@ -101,7 +129,11 @@ provide authoritative casing for the complete phrase; multiword words accept
 the complete phrase without imposing name casing. A component is not accepted
 outside the complete phrase unless it also has its own single-word entry.
 Phrase matching is case-insensitive, requires whitespace rather than intervening
-punctuation, and may cross a subtitle line wrap within one cue. Simple plural
+punctuation for a whitespace-separated entry, and may cross a subtitle line wrap
+within one cue. Compound entries such as `good-natured` preserve their recorded
+separator: they accept the complete compound, but neither `good natured` nor the
+component `natured` in isolation. Both GUI and CLI dictionary additions validate
+the complete entry in the current cue. Simple plural
 and possessive forms of known acronyms retain the acronym's canonical casing,
 for example `MALPs`, `GDOs`, and `SGC's`.
 
@@ -243,6 +275,13 @@ review state. On the next launch, the user may recover or discard that journal.
 Recovery is refused if a prepared source file no longer matches its recorded
 baseline. A restored current issue is revalidated with the running version's
 dictionary rules and advances automatically if it is no longer unknown. The
+journal is retired when scanning is complete and no unsaved prepared bytes
+remain, even if in-memory ignore/Undo history still exists. Unsaved spellcheck
+or formatting changes remain recoverable until saved. Undo reopening a completed
+review makes it recoverable again. Before offering startup recovery, an older
+completed journal is retired only if every prepared file matches the text
+currently saved on disk; incomplete, invalid, drifted or unsaved journals remain.
+This preflight changes neither source files nor current options. The
 journal does not write any subtitle; Undo reverses GUI occurrence
 and session ignores in last-in,
 first-out order and returns the review to the affected occurrence, including
@@ -268,7 +307,9 @@ invalid or structurally ambiguous SRT cue. This action also remains in memory
 and does not alter the source subtitle.
 Search line opens an explicit Google search for the exact highlighted dialogue
 line using the shared markup-stripping behavior and leaves the review state
-unchanged.
+unchanged. GUI searches do not write to a detached text console. A console
+reporting error after a successful browser request must not turn success into
+failure; real browser failures still produce a nonfatal message.
 Save changes becomes available only when prepared subtitle bytes differ from
 the session's saved baseline. It reports the number of affected files, asks
 for confirmation, and, when the backup option is disabled, offers to enable
@@ -388,9 +429,11 @@ Add word / name / acronym / phrase opens an editable dictionary-entry dialog ini
 with the selected unknown. The user may retain that single word or expand it
 to an exact phrase present in the current cue, choose accepted term versus
 authoritative name casing, and explicitly choose the User Dictionary or active
-Universe Dictionary. A phrase must include the selected unknown and match the
-cue using whitespace-only token separation, including across a subtitle line
-wrap. Adding a phrase never accepts its individual components elsewhere.
+Universe Dictionary. A phrase must include the selected unknown.
+Whitespace-separated entries match whitespace-only separation, including
+across a subtitle line wrap; compounds match their recorded punctuation
+separators as described in Section 3. Adding an entry never accepts its
+individual components elsewhere.
 Dictionary additions are persisted immediately and appear in the recent-entry
 log. Authoritative names recase the selected occurrence or complete phrase in
 the prepared cue; that subtitle change remains in memory until Save changes.
@@ -976,9 +1019,15 @@ under `dictionaries`, and a later launch retries. Staging directories and stale
 rollback copies are cleanup debris after a validated restart, not grounds to
 undo an otherwise successful update.
 
-### `v1.1.1` publishing checklist
+### Historical `v1.1.1` publishing checklist
 
-Before publishing the Stage 3 updater release from `main`:
+The following records the original Stage 3 release workflow, not a pending
+instruction to merge the Ren'Py branch. Current subtitle fixes stay on `main`;
+Ren'Py feature work remains on `Ren'PY-Support` unless separately authorized.
+Future publication requires an explicit version/tag/build decision and the
+appropriate regression, checksum and smoke gates. The subsequently authorized
+subtitle bugfix release is `v1.1.2`; it does not merge Ren'Py support. For the
+original Stage 3 updater release from `main`:
 
 1. Exercise a genuinely newer, temporary normal GitHub release from both an
    extracted source installation and the frozen Windows package. Verify public

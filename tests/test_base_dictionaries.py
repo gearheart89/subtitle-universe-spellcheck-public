@@ -51,6 +51,9 @@ class BaseDictionaryTests(unittest.TestCase):
         license_text = (BASE_DICTIONARY_DIR / "SCOWL-COPYRIGHT.txt").read_text(encoding="utf-8")
 
         self.assertIn("2026.02.25", source)
+        self.assertIn("historical generation filter", source)
+        self.assertIn("Unicode", source)
+        self.assertNotIn("ASCII forms expected by the application's current tokenizer", source)
         self.assertIn("7e99edab8e32f9f9ea2b15f249ca8d4d67237410", source)
         self.assertIn("Copyright 2000-2026 by Kevin Atkinson", license_text)
         self.assertIn("Permission to use, copy, modify, distribute", license_text)
