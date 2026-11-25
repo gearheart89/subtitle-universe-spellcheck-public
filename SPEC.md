@@ -956,6 +956,25 @@ not prematurely gain authority to replace an installation.
 
 ### Stage 1 — check and verified ZIP download
 
+Before the stable update path is entered, identify the installation's branch.
+Read source-checkout HEAD through either a `.git` directory or worktree gitdir
+file without executing Git. Only `main` may use public stable updates. Detached,
+development and unknown branches perform no stable check/download/install,
+even when the public version is newer. Preserve the user's consent preference
+without asking for stable-update consent in a development build.
+
+Source builders generate `release_identity.json` with schema 1, application
+version and branch; Windows builders bundle the same record into the frozen
+runtime and verify its presence. This carries branch protection beyond the Git
+checkout. Malformed, mismatched or missing frozen provenance fails closed.
+Legacy stable source exports without provenance remain eligible; an unmarked
+prerelease source export does not. All check, download and installation entry
+points and the final external-helper launch independently enforce the branch
+guard, including a branch change after preparation. Git working copies retain the
+existing blanket refusal of automatic installation, including on `main`.
+This repair is introduced in `1.1.3`: older binaries do not gain it until
+rebuilt. Stable source/Windows builds keep the normal consent and update flow.
+
 When **Check for updates at startup** is enabled, GUI and CLI launches make a
 short-timeout request to the public GitHub Releases API. The request itself is
 the connectivity test; the application must not depend on ping or a separate

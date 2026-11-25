@@ -35,11 +35,15 @@ try {
         throw "The project quill icon assets are missing."
     }
 
+    $identitySource = Join-Path $projectRoot "build\release_identity.json"
+    & $PythonExecutable -c "from pathlib import Path; from tools.build_multiplatform_release import write_release_identity; write_release_identity(Path.cwd(), Path(r'$identitySource'))"
+    if ($LASTEXITCODE -ne 0) { throw "Could not record the update branch identity." }
     & $PythonExecutable -m PyInstaller `
         --noconfirm `
         --clean `
         --onedir `
         --console `
+        --add-data "$identitySource;." `
         --icon $iconPath `
         --paths (Join-Path $projectRoot "app") `
         --name $distributionName `
@@ -99,6 +103,7 @@ try {
 
     $requiredReleasePaths = @(
         $executablePath,
+        (Join-Path $distributionFolder "_internal\release_identity.json"),
         (Join-Path $distributionFolder "SubtitleUniverseUpdater.exe"),
         (Join-Path $distributionFolder "README.md"),
         (Join-Path $distributionFolder "LICENSE"),

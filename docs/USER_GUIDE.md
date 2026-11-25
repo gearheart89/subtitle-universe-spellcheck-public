@@ -346,6 +346,12 @@ the relevant options, a small synthetic reproduction, and the displayed error.
 
 ## Updating a portable Windows installation
 
+The stable updater is restricted to `main` builds. New source ZIPs and Windows
+builds retain branch identity, so a development build does not offer a public
+stable replacement. Unknown/damaged provenance disables automatic updates.
+Use Git or a matching development package instead. Older development binaries
+must be rebuilt to receive this protection.
+
 Close the program and extract the new release to a separate folder. To retain
 personal data, copy these items from the old folder to the matching locations
 in the new folder:

@@ -3524,6 +3524,8 @@ class SubtitleSpellcheckGUI:
 
     def _begin_update_check(self) -> None:
         """Check GitHub off the UI thread and silently tolerate offline startup."""
+        if not self.tool.public_updates_allowed():
+            return
         if self.update_thread is not None or not self.tool.options.get(
             "check_for_updates_at_startup", False
         ):
@@ -3544,6 +3546,8 @@ class SubtitleSpellcheckGUI:
     def _complete_startup(self) -> None:
         """Finish recovery handling before any optional update prompt can appear."""
         self._offer_gui_recovery()
+        if not self.tool.public_updates_allowed():
+            return
         if not self.tool.update_check_preference_confirmed:
             enabled = self.messagebox.askyesno(
                 "Automatic update checks",

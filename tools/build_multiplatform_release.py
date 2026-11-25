@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
+import sys
 import zipfile
 from pathlib import Path
 from typing import Iterable
@@ -13,6 +15,7 @@ from typing import Iterable
 
 PYTHON_REQUIREMENT = "Python 3.9 or later with Tkinter"
 ARCHIVE_PREFIX = "SubtitleUniverseSpellcheck"
+GENERATED_FILES = {"release_identity.json"}
 
 RELEASE_FILES = (
     "README.md",
@@ -48,6 +51,20 @@ def read_version(project_root: Path) -> str:
     if match is None:
         raise RuntimeError(f"Could not read SCRIPT_VERSION from {engine}")
     return match.group(1)
+
+
+def release_identity(project_root: Path) -> dict:
+    """Carry the build branch into exported/frozen applications."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from app.subtitle_cleanup import update_branch
+    version = read_version(project_root)
+    return {"schema_version": 1, "version": version,
+            "branch": update_branch(project_root, version=version)}
+
+
+def write_release_identity(project_root: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(release_identity(project_root), indent=2) + "\n", encoding="utf-8")
 
 
 def validate_manifest(manifest: Iterable[tuple[Path, Path]]) -> None:
@@ -100,13 +117,15 @@ def build_source_release(
     ) as archive:
         for source, relative_destination in manifest:
             archive.write(source, (Path(archive_root) / relative_destination).as_posix())
+        archive.writestr(f"{archive_root}/release_identity.json",
+                         json.dumps(release_identity(root), indent=2) + "\n")
 
     validate_archive(
         archive_path,
         {
             (Path(archive_root) / relative_destination).as_posix()
             for _source, relative_destination in manifest
-        },
+        } | {f"{archive_root}/{name}" for name in GENERATED_FILES},
     )
 
     digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()

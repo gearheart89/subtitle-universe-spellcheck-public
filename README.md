@@ -7,9 +7,8 @@ constructed-language terms, and recurring transcription errors that do not
 belong in a general English dictionary. Both interfaces use the same tested
 engine and safety boundaries.
 
-Version **1.1.2** is a subtitle bugfix release covering accented words,
-possessives, hyphenated entries, quoted-word review, browser-search reporting,
-and completed-scan recovery.
+Version **1.1.3** adds branch-aware updater protection to the subtitle fixes
+released in `1.1.2`.
 
 Version 1 capabilities include:
 
@@ -54,6 +53,12 @@ preparation use the same tag-, abbreviation-, and URL-aware implementation.
 Windows is the currently hardware-tested platform. macOS and Linux are expected
 to work and have automated cross-platform coverage, but have
 not yet been validated on physical systems by the project.
+
+Development builds carry their branch identity into source/Windows packages.
+They cannot be replaced through the public stable updater, regardless of how
+far the stable version advances. Unknown provenance also disables that path;
+use a matching development build or Git. This protection is introduced in
+`1.1.3` and requires rebuilding older development executables.
 
 Official Windows Python installers bundle Tkinter, and the frozen Windows
 release carries the GUI components selected at build time, so neither route

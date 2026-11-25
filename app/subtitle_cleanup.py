@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-SCRIPT_VERSION = "1.1.2"
+SCRIPT_VERSION = "1.1.3"
 SCHEMA_VERSION = 1
 PROJECT_URL = "https://github.com/gearheart89/subtitle-universe-spellcheck-public"
 TKINTER_DOCS_URL = "https://docs.python.org/3/library/tkinter.html"
@@ -547,6 +547,37 @@ def application_entry_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve()
     return Path(__file__).resolve()
+
+
+def update_branch(root: Path, *, version: str = SCRIPT_VERSION) -> str:
+    """Read branch provenance without executing Git; unknown builds fail closed."""
+    root = Path(root).resolve()
+    frozen = bool(getattr(sys, 'frozen', False))
+    try:
+        marker = root / '.git'
+        if not frozen and marker.exists():
+            gitdir = marker
+            if marker.is_file():
+                value = marker.read_text(encoding='utf-8').strip()
+                if not value.startswith('gitdir: '):
+                    return 'unknown'
+                gitdir = (root / value[8:]).resolve()
+            head = (gitdir / 'HEAD').read_text(encoding='utf-8').strip()
+            prefix = 'ref: refs/heads/'
+            return head[len(prefix):] if head.startswith(prefix) and head[len(prefix):] else 'detached'
+        metadata_root = Path(getattr(sys, '_MEIPASS', root)) if frozen else root
+        identity = metadata_root / 'release_identity.json'
+        if identity.exists():
+            payload = json.loads(identity.read_text(encoding='utf-8'))
+            if (payload.get('schema_version') != 1 or payload.get('version') != version
+                    or not isinstance(payload.get('branch'), str) or not payload['branch'].strip()):
+                return 'unknown'
+            return payload['branch']
+        if frozen or '-' in version:
+            return 'unknown'
+        return 'main'  # Stable source exports predating branch provenance.
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
+        return 'unknown'
 
 
 def clear_screen() -> None:
@@ -1212,6 +1243,13 @@ class SubtitleCleanupTool:
     # ------------------------------------------------------------------
     # Stage 1 update discovery and verified ZIP download
     # ------------------------------------------------------------------
+    def public_updates_allowed(self) -> bool:
+        return update_branch(getattr(self, 'script_dir', application_root())) == 'main'
+
+    def _require_public_update_channel(self) -> None:
+        if not self.public_updates_allowed():
+            raise UpdateError('Public stable updates are disabled for this development or unknown branch. Use a matching branch build instead.')
+
     def check_for_update(
         self,
         *,
@@ -1223,6 +1261,8 @@ class SubtitleCleanupTool:
         timeout: float = UPDATE_TIMEOUT_SECONDS,
     ) -> Optional[ReleaseUpdate]:
         """Return the matching newer release without downloading or installing it."""
+        if not self.public_updates_allowed():
+            return None
         request = urllib.request.Request(
             UPDATE_API_URL,
             headers={
@@ -1314,6 +1354,7 @@ class SubtitleCleanupTool:
         timeout: float = UPDATE_TIMEOUT_SECONDS,
     ) -> Tuple[Path, Path]:
         """Download and verify an update ZIP without replacing application files."""
+        self._require_public_update_channel()
         destination = Path(destination)
         if destination.suffix.casefold() != ".zip":
             raise UpdateError("The update download must be saved as a ZIP file.")
@@ -1453,14 +1494,15 @@ class SubtitleCleanupTool:
         """Validate and stage an update transaction without changing the installation."""
         if interface not in {"gui", "cli"}:
             raise ValueError("The update interface must be gui or cli.")
-        archive_path = Path(archive_path).resolve()
-        digest = self._verify_local_update_archive(archive_path)
         installation = Path(self.script_dir).resolve()
         if (installation / ".git").exists():
             raise UpdateError(
                 "Automatic installation is disabled for a Git working copy. "
                 "Update that checkout with Git instead."
             )
+        self._require_public_update_channel()
+        archive_path = Path(archive_path).resolve()
+        digest = self._verify_local_update_archive(archive_path)
         is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
 
         stage_base = Path(staging_parent).resolve() if staging_parent else installation.parent
@@ -1561,6 +1603,7 @@ class SubtitleCleanupTool:
         process_launcher: Callable[..., object] = subprocess.Popen,
     ) -> object:
         """Start the external updater; the caller should then close normally."""
+        self._require_public_update_channel()
         options: Dict[str, object] = {"close_fds": True}
         if os.name == "nt":
             options["creationflags"] = 0x00000008
@@ -1580,6 +1623,8 @@ class SubtitleCleanupTool:
 
     def check_for_updates_cli(self) -> bool:
         """Offer a verified update at CLI startup; return true when updater launched."""
+        if not self.public_updates_allowed():
+            return False
         if not getattr(self, "update_check_preference_confirmed", False):
             print(
                 "\nSubtitle Universe Spellcheck can check the public GitHub Releases "

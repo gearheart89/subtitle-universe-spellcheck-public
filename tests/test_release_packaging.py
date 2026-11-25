@@ -67,6 +67,7 @@ class ReleasePackagingTests(unittest.TestCase):
                     PROJECT_ROOT
                 )
             }
+            expected_tail_paths.update(build_multiplatform_release.GENERATED_FILES)
             archive_roots = {name.split("/", 1)[0] for name in files}
             self.assertEqual(len(archive_roots), 1)
             root = archive_roots.pop()
